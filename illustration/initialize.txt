@@ -1,0 +1,19 @@
+1.引入依赖
+Lombok 简化getter和setter方法、toString、equals、@Slf4j 日志对象等代码
+Spring Boot DevTools热部署（自动重启 + 浏览器刷新）
+Spring Web SpringMVC内嵌Tomcat
+MyBatis Framework MyBatis 进行ORM映射
+MySQL Driver 数据库MySQL 运行时通过 JDBC 连接 MySQL
+Spring Data Redis (Access+Driver) 中间件缓存redis
+2.项目前期框架
+entity实体类 （数据库映射的Java对象）
+mapper映射文件
+service业务层 （具体的业务实现）
+controller控制层 （处理HTTP请求）
+dto 前端给后端的数据
+vo 后端给前端的数据
+config 配置文件
+interceptor拦截器
+util工具类
+commom公共使用的代码
+illustration记录每个版本的详细记录 放在根目录不会重复提交
