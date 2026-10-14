@@ -9,12 +9,14 @@ spring:
     username: ${DB_USERNAME:root}
     password: ${DB_PASSWORD:123456}
     driver-class-name: com.mysql.cj.jdbc.Driver
-  # Redis：Token 黑名单 + 商品详情缓存。连接失败不影响启动，运行期各调用点自带降级。
+  # Redis：Token 黑名单 + 商品详情缓存 + 秒杀库存 / 防重 / 结果缓存。
+  # v3.0 起 Redis 成了秒杀链路的必需依赖 —— 连不上时秒杀接口会走降级或直接 503，
+  # 但商品、购物车、普通订单这些功能仍然照常（各调用点自带降级）。
   data:
     redis:
-      host: ${REDIS_HOST:localhost}
+      host: ${REDIS_HOST:192.168.77.140}
       port: ${REDIS_PORT:6379}
-      password: ${REDIS_PASSWORD:123456}
+      password: ${REDIS_PASSWORD:novamart-redis-2026}
       database: ${REDIS_DATABASE:0}
       timeout: 2s
       lettuce:
@@ -22,7 +24,40 @@ spring:
           max-active: 16
           max-idle: 8
           min-idle: 0
-  # 日期格式统一按东八区输出
+  # RabbitMQ（v3.0 新增）：秒杀请求削峰。跑在虚拟机里的 Docker 上，
+  # 通过 REDIS_HOST / RABBITMQ_HOST 这类环境变量指过去，不写死在配置里。
+  rabbitmq:
+    host: ${REDIS_HOST:192.168.77.140}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:novamart}
+    password: ${RABBITMQ_PASSWORD:novamart-mq-2026}
+    virtual-host: ${RABBITMQ_VHOST:novamart}
+    connection-timeout: 10s
+    # Publisher Confirm：消息被 Broker 接收后回调确认。缺了它，
+    # 「消息没进队列」这件事就永远发现不了（投递失败要回补库存就靠这个信号）。
+    publisher-confirm-type: correlated
+    # Publisher Returns：配合 mandatory 使用，路由不到队列时把消息退回来。
+    publisher-returns: true
+    template:
+      mandatory: true
+    listener:
+      simple:
+        # 手动 ack：确认时机由业务决定 —— 订单落库成功才 ack，失败就 nack 进死信队列。
+        # 用自动 ack 的话，方法一返回就算处理完了，数据库抖动那几分钟的失败就全丢了。
+        acknowledge-mode: manual
+        # 固定 3 个消费者线程起步，堆积时最多扩到 10 个 —— 数据库看到的就是这个速率，
+        # 而不是上万个并发连接。这就是「削峰」真正发生的地方。
+        concurrency: ${RABBITMQ_CONCURRENCY:3}
+        max-concurrency: ${RABBITMQ_MAX_CONCURRENCY:10}
+        # 每个消费者最多「欠」一条未确认消息：让负载在消费者之间分得均匀，
+        # 预取太多会让某个消费者攒一堆消息忙不过来、而别的消费者闲着。
+        prefetch: ${RABBITMQ_PREFETCH:1}
+        # 处理失败不回原队列。一直 requeue 的话，同一条坏消息会反复回到队首把消费者卡死；
+        # 我们改成 nack，由队列的 x-dead-letter-* 参数把它转发到死信队列留痕。
+        default-requeue-rejected: false
+        # Broker 上队列暂时不存在也不阻止应用启动（RabbitAdmin 会持续重试声明队列）
+        missing-queues-fatal: false
+  # 日期格式统一按东八区输出（注意只作用于 java.util.Date，LocalDateTime 要自己加 @JsonFormat）
   jackson:
     date-format: yyyy-MM-dd HH:mm:ss
     time-zone: GMT+8
@@ -56,3 +91,38 @@ novamart:
   cors:
     # 前端 dev server（Vite 5173）；生产由后端直接托管静态页，属同源
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}
+  # Redisson 是独立客户端，不读 spring.data.redis.*，所以单独配一份。
+  # host/port/password 从同一批环境变量取值，不会出现「配了一个忘了另一个」。
+  redisson:
+    host: ${REDIS_HOST:192.168.77.140}
+    port: ${REDIS_PORT:6379}
+    password: ${REDIS_PASSWORD:novamart-redis-2026}
+    database: ${REDIS_DATABASE:0}
+    connection-pool-size: ${REDISSON_POOL_SIZE:16}
+    connection-minimum-idle-size: ${REDISSON_MIN_IDLE:2}
+    timeout-millis: ${REDISSON_TIMEOUT_MS:3000}
+    connect-timeout-millis: ${REDISSON_CONNECT_TIMEOUT_MS:5000}
+    retry-attempts: ${REDISSON_RETRY_ATTEMPTS:3}
+    retry-interval-millis: ${REDISSON_RETRY_INTERVAL_MS:1500}
+    # 看门狗周期（毫秒）：只在没显式传 leaseTime 时才生效，项目里都显式传了，这里当兜底
+    lock-watchdog-timeout-millis: ${REDISSON_LOCK_WATCHDOG_MS:30000}
+  # 秒杀（v3.0 新增）
+  seckill:
+    # 秒杀订单多久没支付就自动关单并释放库存。这个值同时是 RabbitMQ 延迟队列的
+    # x-message-ttl —— 改它要同步改队列参数，而队列已存在时 RabbitMQ 会拒绝
+    # 参数变更，需要在 Broker 上把 seckill.delay.queue 删掉让它重建。
+    order-delay-millis: ${SECKILL_ORDER_DELAY_MS:900000}
+    # Redis 扣减不可用时，是否允许走「Redisson 锁 + 数据库扣减」的降级链路。
+    # 设成 false 则 Redis 一挂秒杀直接 503（宁可拒绝服务，也不让数据库被打穿）。
+    fallback-enabled: ${SECKILL_FALLBACK_ENABLED:true}
+    # 用户级锁 / 兜底链路的锁参数
+    lock-wait-seconds: ${SECKILL_LOCK_WAIT_SECONDS:2}
+    lock-lease-seconds: ${SECKILL_LOCK_LEASE_SECONDS:10}
+    # 整活动锁参数（预热、降级链路）：临界区更重，等和持有都给长一点
+    activity-lock-wait-seconds: ${SECKILL_ACTIVITY_LOCK_WAIT_SECONDS:3}
+    activity-lock-lease-seconds: ${SECKILL_ACTIVITY_LOCK_LEASE_SECONDS:15}
+    # 最终结果（成功/售罄/重复）在 Redis 里保留 1 小时
+    result-ttl-seconds: ${SECKILL_RESULT_TTL_SECONDS:3600}
+    # 「排队中」只保留 2 分钟：万一消息真丢了，它自己会过期，
+    # 之后结果查询会如实回答「没有记录」，而不是一直骗用户「正在处理」
+    queued-ttl-seconds: ${SECKILL_QUEUED_TTL_SECONDS:120}

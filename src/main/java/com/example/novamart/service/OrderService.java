@@ -10,6 +10,8 @@ import com.example.novamart.entity.Product;
 import com.example.novamart.mapper.OrderItemMapper;
 import com.example.novamart.mapper.OrderMapper;
 import com.example.novamart.mapper.ProductMapper;
+import com.example.novamart.util.BizAssert;
+import com.example.novamart.util.OrderNoGenerator;
 import com.example.novamart.util.PageUtil;
 import com.example.novamart.vo.CartVO;
 import com.example.novamart.vo.OrderDetailVO;
@@ -21,11 +23,9 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -68,9 +68,7 @@ public class OrderService {
     @Transactional
     public OrderDetailVO submit(long userId) {
         List<CartVO> cartItems = cartService.list(userId);
-        if (cartItems.isEmpty()) {
-            throw new BusinessException(ErrorCode.CART_NOT_FOUND, "购物车是空的，先加商品再下单");
-        }
+        BizAssert.isTrue(!cartItems.isEmpty(), ErrorCode.CART_NOT_FOUND, "购物车是空的，先加商品再下单");
 
         // 1. 加行锁。SQL 里带了 ORDER BY id，并发事务按同样顺序申请锁，不会循环等待成死锁。
         List<Long> productIds = cartItems.stream()
@@ -86,15 +84,13 @@ public class OrderService {
         List<OrderItem> orderItems = new ArrayList<>(cartItems.size());
         for (CartVO cartItem : cartItems) {
             Product product = lockedProducts.get(cartItem.productId());
-            if (product == null || product.getStatus() == null
-                    || product.getStatus() != Product.STATUS_ON_SALE) {
-                throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND,
-                        "「" + cartItem.productName() + "」已下架，请先移出购物车");
-            }
-            if (product.getStock() < cartItem.quantity()) {
-                throw new BusinessException(ErrorCode.INVALID_ARGUMENT,
-                        "「" + product.getName() + "」库存不足，仅剩 " + product.getStock() + " 件");
-            }
+            BizAssert.notNull(product, ErrorCode.PRODUCT_NOT_FOUND);
+            BizAssert.isTrue(product.getStatus() != null && product.getStatus() == Product.STATUS_ON_SALE,
+                    ErrorCode.PRODUCT_NOT_FOUND,
+                    "「" + cartItem.productName() + "」已下架，请先移出购物车");
+            BizAssert.isTrue(product.getStock() >= cartItem.quantity(),
+                    ErrorCode.INVALID_ARGUMENT,
+                    () -> "「" + product.getName() + "」库存不足，仅剩 " + product.getStock() + " 件");
             deductStock(product.getId(), cartItem.quantity());
 
             OrderItem item = new OrderItem();
@@ -111,7 +107,7 @@ public class OrderService {
 
         // 3. 写订单主表（insert 后自增 id 会回填到 order.id）
         Order order = new Order();
-        order.setOrderNo(generateOrderNo());
+        order.setOrderNo(OrderNoGenerator.next());
         order.setUserId(userId);
         order.setTotalAmount(totalAmount);
         order.setStatus(Order.STATUS_UNPAID);
@@ -256,23 +252,11 @@ public class OrderService {
     /** 查订单并校验归属，防止拿到别人的订单 id 越权访问 */
     private Order requireOwnOrder(long userId, long orderId) {
         Order order = orderMapper.selectById(orderId);
-        if (order == null || !order.getUserId().equals(userId)) {
-            throw new BusinessException(ErrorCode.ORDER_NOT_FOUND);
-        }
+        BizAssert.isTrue(order != null && order.getUserId() == userId, ErrorCode.ORDER_NOT_FOUND);
         return order;
     }
 
     private Order requireOrder(long orderId) {
-        Order order = orderMapper.selectById(orderId);
-        if (order == null) {
-            throw new BusinessException(ErrorCode.ORDER_NOT_FOUND);
-        }
-        return order;
-    }
-
-    /** 订单号 = 毫秒级时间 + 4 位随机数；order_no 上的唯一索引兜底防重 */
-    private static String generateOrderNo() {
-        return LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS"))
-                + String.format("%04d", ThreadLocalRandom.current().nextInt(10000));
+        return BizAssert.notNull(orderMapper.selectById(orderId), ErrorCode.ORDER_NOT_FOUND);
     }
 }

@@ -20,6 +20,8 @@
         <mybatis-plus.version>3.5.17</mybatis-plus.version>
         <pagehelper.version>6.1.0</pagehelper.version>
         <java-jwt.version>4.4.0</java-jwt.version>
+        <!--Redisson：分布式锁。4.x 直接支持 Jackson 3，且编译目标是 Java 8 字节码，Java 17 上可用-->
+        <redisson.version>4.8.0</redisson.version>
     </properties>
     <dependencies>
         <!--SpringMVC 内嵌 Tomcat RESTful API 控制器 请求映射 拦截器 异常处理-->
@@ -43,6 +45,34 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <!--
+            v3.0 新增：RabbitMQ，秒杀请求削峰。
+            Redis+Lua 扣减成功后不直接落库，而是把消息投进队列就立刻返回「排队中」，
+            消费者按自己的节奏去数据库建单 —— 瞬时上万请求被队列抹成一条平稳的流水线。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+        <!--
+            v3.0 新增：WebSocket，秒杀结果实时推送。
+            异步落库完成后由服务端主动推给对应用户，前端不用轮询。
+            用原生 WebSocket（不是 STOMP），握手时从 query 里取 token 换 userId。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-websocket</artifactId>
+        </dependency>
+        <!--
+            v3.0 新增：Redisson，分布式锁兜底超卖。
+            只引 core 包、在 RedissonConfiguration 里自己 new RedissonClient，
+            不用 redisson-spring-boot-starter —— 避免它的自动配置和 Spring Boot 4 的依赖管理打架。
+        -->
+        <dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson</artifactId>
+            <version>${redisson.version}</version>
         </dependency>
         <!--参数校验 DTO上的 @NotNull @NotBlank @Pattern @Size-->
         <dependency>

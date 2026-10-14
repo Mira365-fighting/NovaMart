@@ -3,7 +3,9 @@ package com.example.novamart.common.exception;
 import com.example.novamart.common.result.ApiResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.amqp.AmqpException;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -72,6 +74,35 @@ public class GlobalExceptionHandler {
         log.warn("唯一键冲突：{}", exception.getMessage());
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(ApiResult.error(ErrorCode.CONFLICT.getCode(), ErrorCode.CONFLICT.getMessage()));
+    }
+
+    /**
+     * Redis 不可用 → 503。
+     *
+     * <p>和 v2.0 的处理方式不同：那时候所有 Redis 调用点都自己 catch 掉了，
+     * 请求照常返回。v3.0 的秒杀链路里，「Redis 挂了」是<b>必须让调用方知道</b>的信号 ——
+     * 因为库存就在 Redis 上，读不到库存就不能放请求过去。
+     * 所以 SeckillStockService 会把它翻译成 {@code REDIS_UNAVAILABLE} 交给业务分支，
+     * 而这里兜的是「有人忘了处理、直接让异常冒出来」的情况。
+     *
+     * <p>返回 503 而不是 500：这是「暂时不可用、重试可能就好」，不是代码 bug，
+     * 网关和监控看到 503 会按可用性问题处理（比如触发重试或熔断），比 500 更准确。
+     */
+    @ExceptionHandler(RedisConnectionFailureException.class)
+    public ResponseEntity<ApiResult<Void>> handleRedisUnavailable(RedisConnectionFailureException exception) {
+        log.error("Redis 不可用：{}", exception.getMessage());
+        return ResponseEntity.status(ErrorCode.SERVICE_UNAVAILABLE.getHttpStatus())
+                .body(ApiResult.error(ErrorCode.SERVICE_UNAVAILABLE.getCode(),
+                        ErrorCode.SERVICE_UNAVAILABLE.getMessage()));
+    }
+
+    /** RabbitMQ 不可用 → 503。原因同上：属于「暂时不可用」，不是业务错误 */
+    @ExceptionHandler(AmqpException.class)
+    public ResponseEntity<ApiResult<Void>> handleAmqpUnavailable(AmqpException exception) {
+        log.error("RabbitMQ 不可用：{}", exception.getMessage());
+        return ResponseEntity.status(ErrorCode.SERVICE_UNAVAILABLE.getHttpStatus())
+                .body(ApiResult.error(ErrorCode.SERVICE_UNAVAILABLE.getCode(),
+                        ErrorCode.SERVICE_UNAVAILABLE.getMessage()));
     }
 
     /** 兜底：没预料到的异常记日志，对外只说「系统异常」 */

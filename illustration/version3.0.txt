@@ -1,0 +1,1084 @@
+# NovaMart v3.0 —— 高并发秒杀：Redis+Lua 原子扣减 + RabbitMQ 异步削峰 + Redisson 兜底 + WebSocket 推送
+
+> 本版在 v2.0（前后台分离 + 完整登录态 + Vue3 前端）之上做了一件大事：**新增秒杀域**，
+> 并把「高并发下不超卖」这条线做到三层冗余：
+>
+> ```
+> ① Redis + Lua 原子扣减（性能层，挡住 99% 的无效请求，不碰数据库）
+> ② RabbitMQ 异步落库（削峰层，把瞬时上万并发压成数据库能承受的恒定速率）
+> ③ Redisson 分布式锁 + DB 条件更新 + 唯一索引（正确性层，前两层全失效也不超卖）
+> ```
+>
+> 顺带做了一遍**代码治理与 util 提炼**：Redis key 集中管理、JSON 序列化收敛、
+> 断言工具化、订单号生成器抽出、事务边界手写。
+>
+> **本版新增的外部依赖（Redis、RabbitMQ）全部跑在虚拟机的 Docker 里**，
+> 通过 `docker-compose.yml` 编排，宿主机经 SSH 驱动 —— 完整连接步骤见 **第七章**。
+
+---
+
+## 一、需求
+
+1. **Redis + Lua 原子扣减库存**
+   - 把「校验库存 → 校验是否重复购买 → 扣减 → 记下购买者」压成**一个 Lua 脚本**，
+     在 Redis 单线程内原子执行，彻底避免「查了再改」之间被并发穿插；
+   - 活动信息（商品名 / 原价 / 时间窗口）预热进 Redis，**抢购链路零查库**；
+   - 扣减成功立刻投递 MQ 消息，请求立即返回「排队中」，不等数据库落库。
+2. **RabbitMQ 异步落库削峰**
+   - 抢购成功后只把订单消息投进队列，真正的入库由消费者按自己的节奏做；
+   - 用**队列级 TTL + 死信交换机**做延迟队列，实现「15 分钟未支付自动关单释放库存」，
+     不依赖 `rabbitmq_delayed_message_exchange` 插件；
+   - **手动 ACK**：落库成功才确认，失败就 nack 进死信队列留痕，不静默丢消息；
+   - **Publisher Confirm + Returns**：消息没进队列能感知到，并且**把已扣的库存还回去**。
+3. **Redisson 分布式锁兜底超卖**
+   - 消费者落库时按「活动 + 用户」加锁，同一用户同一活动的重复消息串行化；
+   - Redis 扣减不可用时的**降级链路**：整活动一把锁 + 数据库条件扣减，吞吐换正确性；
+   - 锁必须**在事务之外**：先加锁 → 开事务 → 提交 → 再解锁，否则会出现
+     「锁已释放但事务还没提交，别的线程读不到这行数据」的经典漏洞。
+4. **WebSocket 实时推送秒杀结果**
+   - 用户下单后不再轮询，服务端落库完成那一刻把结果推给浏览器；
+   - 用原生 WebSocket（不引 STOMP），握手时用 `?token=` 做鉴权；
+   - 推送只是「通知」，**权威结果始终在 MySQL**，并提供 `GET /result/{activityId}` 兜底。
+5. **代码治理与 util 提炼**（本版同一批次完成）
+   - Redis key 从「散落四个类」收敛到 `util/RedisKeys`；
+   - JSON 序列化封成 `util/JsonUtil`，不再各处 new ObjectMapper；
+   - 参数断言封成 `util/BizAssert`，把 `if (x == null) throw new BusinessException(...)` 压成一行；
+   - 订单号生成从 `OrderService` 的私有方法提成 `util/OrderNoGenerator`，秒杀订单复用并换 `SK` 前缀。
+6. Redis 与 RabbitMQ **跑在虚拟机的 Docker 里**，用 `docker-compose.yml` 编排，
+   宿主机经 **SSH** 驱动；后端只负责代码与配置，**连接过程写在本文档第七章**。
+
+---
+
+## 二、本版新引入的依赖
+
+### 后端（pom.xml）
+
+| 依赖 | 版本 | 用途 |
+| --- | --- | --- |
+| `spring-boot-starter-amqp` | 随 parent | RabbitMQ：削峰 + 延迟队列 + 手动 ACK + Confirm/Returns |
+| `spring-boot-starter-websocket` | 随 parent | 原生 WebSocket + `HandshakeInterceptor` 握手鉴权 |
+| `org.redisson:redisson` | **4.8.0** | 分布式锁（`RLock`） |
+
+已有的依赖保持不变：`spring-boot-starter-webmvc`、`spring-boot-starter-validation`、
+`spring-boot-starter-security`、
+`mybatis-plus-spring-boot4-starter` 3.5.17、`pagehelper` 6.1.0（核心包）、
+`spring-boot-starter-data-redis`、`com.auth0:java-jwt` 4.4.0、`lombok`、
+`mysql-connector-j`、`spring-boot-devtools`。
+
+**关于 Redisson 版本的两个坑（选 4.8.0 的原因）**：
+
+- 它编译时 `maven.compiler.release=8`，即字节码目标是 Java 8，**在 Java 17 上跑没问题**；
+- 它**已经支持 Jackson 3**（内部引用 `tools.jackson.databind`），和本项目 Spring Boot 4 的
+  Jackson 3 体系不冲突。
+
+**关于引入方式**：只引**核心 jar**，手动构造 `RedissonClient` 并做成**懒初始化**，
+**没有**引 `redisson-spring-boot-starter`。原因有两个：
+
+1. 那个 starter 会带进它自己的一套自动配置和 Redis 连接池管理，和 v2.0 已经在用的
+   Spring Data Redis（Lettuce）**共用一批连接参数却各管各的**，容易出现「一处改了另一处没改」；
+2. 更要紧的是**启动依赖**：starter 的自动配置在容器启动时就要连 Redis，
+   Redis 没起来应用直接启动失败。本项目要的是「Redis 挂了商品/购物车/普通订单照常可用」，
+   所以改成 `RedissonClientProvider` 懒加载 —— 第一次真正要用锁时才建连接，
+   建不起来就抛 `503`，**不影响应用启动**。
+
+### 前端（frontend/package.json）
+
+本版前端**未新增依赖**，WebSocket 用浏览器原生 `WebSocket` API。
+
+---
+
+## 三、配置文件结构
+
+### 1. 新增的四个配置类（`config/`、`lock/`）
+
+| 文件 | 作用 |
+| --- | --- |
+| `config/RedissonProperties.java` | Redisson 的独立配置。Redisson **不读** `spring.data.redis.*`，所以单独配一份，但 host/port/password 从**同一批环境变量**取值，不会出现「配了一个忘另一个」 |
+| `config/SeckillProperties.java` | 秒杀业务参数：订单超时时间、降级开关、用户锁/活动锁的等待与持有时间、结果缓存 TTL |
+| `config/RabbitMQConfiguration.java` | 声明 2 交换机 + 4 队列 + 全部绑定关系 |
+| `config/WebSocketConfiguration.java` | `@EnableWebSocket`，注册 `/ws/seckill` 端点与握手拦截器 |
+
+### 2. `src/main/resources/application.yml`
+
+v2.0 的块全部保留，新增三块：
+
+```yaml
+spring:
+  data:
+    redis:                      # v2.0 已有，本版复用为秒杀库存载体
+      host / port / password / database / timeout
+      lettuce.pool: max-active / max-idle / min-idle
+  rabbitmq:                     # ★ 本版新增
+    host / port / username / password
+    virtual-host                # 必须和 compose 里的 RABBITMQ_DEFAULT_VHOST 一致
+    connection-timeout: 10s
+    publisher-confirm-type: correlated   # Broker 收到消息后回调（投递失败要靠它回补库存）
+    publisher-returns: true              # 路由不到队列时把消息退回来
+    template.mandatory: true             # 与上面那行配套使用
+    listener.simple:
+      acknowledge-mode: manual           # 手动 ack：落库成功才确认
+      concurrency: 3                     # 固定 3 个消费者线程起步
+      max-concurrency: 10                # 堆积时最多扩到 10 个  ← 「削峰」真正发生的地方
+      prefetch: 1                        # 每个消费者最多欠一条未确认消息，负载更均匀
+      default-requeue-rejected: false     # 失败 nack，交给死信队列，不反复回队首卡死
+      missing-queues-fatal: false        # 队列暂时不存在不阻止应用启动
+
+novamart:
+  redisson:                     # ★ 本版新增
+    host / port / password / database          # 与 spring.data.redis 同源
+    connection-pool-size: 16
+    connection-minimum-idle-size: 2
+    timeout-millis: 3000
+    connect-timeout-millis: 5000
+    retry-attempts: 3
+    retry-interval-millis: 1500
+    lock-watchdog-timeout-millis: 30000        # 只在没显式传 leaseTime 时生效，项目里都显式传了
+  seckill:                      # ★ 本版新增
+    order-delay-millis: 900000                 # 15 分钟未支付自动关单；★ 它同时是延迟队列的 x-message-ttl
+    fallback-enabled: true                     # Redis 扣减不可用时是否走「锁 + DB 扣减」降级
+    lock-wait-seconds: 2                       # 用户级锁
+    lock-lease-seconds: 10
+    activity-lock-wait-seconds: 3              # 整活动锁（预热 / 降级链路）
+    activity-lock-lease-seconds: 15
+    result-ttl-seconds: 3600                   # 最终结果在 Redis 保留 1 小时
+    queued-ttl-seconds: 120                    # 「排队中」只保留 2 分钟，过期就如实回答「没有记录」
+```
+
+全部走 `${环境变量:默认值}`，部署时用环境变量覆盖，不改代码。本版新增的环境变量：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RABBITMQ_HOST` / `RABBITMQ_PORT` | localhost / 5672 | RabbitMQ 连接（**指向虚拟机 IP**） |
+| `RABBITMQ_USERNAME` / `RABBITMQ_PASSWORD` | novamart / novamart123 | 与 compose 的 `.env` 保持一致 |
+| `RABBITMQ_VHOST` | novamart | 与 compose 的 `RABBITMQ_DEFAULT_VHOST` 保持一致 |
+| `RABBITMQ_CONCURRENCY` / `..._MAX_CONCURRENCY` / `..._PREFETCH` | 3 / 10 / 1 | 消费者并发与预取 |
+| `REDISSON_POOL_SIZE` / `..._MIN_IDLE` | 16 / 2 | Redisson 连接池 |
+| `REDISSON_TIMEOUT_MS` / `..._CONNECT_TIMEOUT_MS` | 3000 / 5000 | 超时 |
+| `REDISSON_RETRY_ATTEMPTS` / `..._RETRY_INTERVAL_MS` | 3 / 1500 | 重试 |
+| `REDISSON_LOCK_WATCHDOG_MS` | 30000 | 看门狗周期（兜底用） |
+| `SECKILL_ORDER_DELAY_MS` | 900000 | 订单超时时间，**改它要重建延迟队列** |
+| `SECKILL_FALLBACK_ENABLED` | true | 降级开关 |
+| `SECKILL_LOCK_WAIT_SECONDS` / `..._LEASE_SECONDS` | 2 / 10 | 用户级锁参数 |
+| `SECKILL_ACTIVITY_LOCK_WAIT_SECONDS` / `..._LEASE_SECONDS` | 3 / 15 | 活动锁参数 |
+| `SECKILL_RESULT_TTL_SECONDS` / `..._QUEUED_TTL_SECONDS` | 3600 / 120 | 结果缓存 TTL |
+
+> ⚠️ 注意 `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` 是 v2.0 就有的，
+> 本版**秒杀库存也走这三个变量**（`spring.data.redis` 和 `novamart.redisson` 同源），
+> 部署到虚拟机时**只需要把这三个指向虚拟机 IP**，不用另配一份。
+
+### 3. 基础设施 `docker-compose.yml` + `.env`
+
+| 文件 | 用途 |
+| --- | --- |
+| `docker-compose.yml` | 编排 `redis` + `rabbitmq` 两个服务，2 个命名卷 + 1 个 bridge 网络 |
+| `.env.example` | 环境变量模板，**复制成 `.env` 后按需改密码** |
+| `.gitignore` | 已追加 `.env`（里面有密码，不进版本库） |
+
+`docker-compose.yml` 的关键点（逐条都写了 ★ 注释）：
+
+- **Redis 必须 `--maxmemory-policy noeviction`**。这是**正确性要求，不是调优选项**：
+  秒杀库存就存在 Redis 里，一旦内存满了被 LRU 淘汰掉，
+  抢购时读不到库存 key（脚本返回 `-3`），更糟的是淘汰后重新预热会
+  **把已经卖掉的量又算回来 —— 那就是超卖**。
+  `noeviction` 的行为是「内存满了写操作直接报错」，宁可写失败也不要静默丢数据。
+- `--appendonly yes --appendfsync everysec`：AOF 持久化。库存丢了会超卖。
+- **RabbitMQ 的 `RABBITMQ_DEFAULT_VHOST` 必须和后端 `RABBITMQ_VHOST` 一致**，
+  否则应用连上去会发现「队列一个都不在」，表现为消费者起不来、消息全部路由失败。
+- 两个服务都配了 healthcheck（`redis-cli ping` / `rabbitmq-diagnostics -q ping`），
+  便于用 `docker compose ps` 一眼看健康状态。
+
+### 4. 数据库脚本（`src/main/resources/db/`）
+
+| 文件 | 用途 |
+| --- | --- |
+| `schema.sql` | **全新安装**：v1.0/v2.0 的五张表 + 本版新增 `seckill_activity` / `seckill_order` + 一条演示活动 |
+| `upgrade.sql` | v1.x → v2.0 的老库升级（本版未改动） |
+| `upgrade_v3.sql` | v2.0 → v3.0 的老库升级：`CREATE TABLE IF NOT EXISTS` 两张表 + `INSERT IGNORE` 演示活动，**可重复执行** |
+
+两张新表：
+
+- `seckill_activity`：`seckill_stock` 是**数据库侧的权威剩余库存**，
+  每条秒杀订单落库时用带条件的 UPDATE 扣它一次（`WHERE seckill_stock >= 1`），
+  所以**它永远不会变成负数** —— 这是不超卖的最后一道防线；
+  索引 `idx_seckill_activity_window (start_time, end_time)` 供前台按时间窗口筛活动。
+- `seckill_order`：和 `orders` **分表**，因为它需要一个普通订单没有的概念 ——
+  **`UNIQUE KEY uk_seckill_order_user (activity_id, user_id)`**。
+  这是「一人一单」的最终保证：Redis 的 `seckill:bought:{id}` 集合是快速判断，
+  可能因为 Redis 重启 / 被 FLUSH 而丢失；这个唯一索引不会丢，
+  **任何并发下的重复插入都会被数据库拒绝**。
+  另外 `order_no` 也有唯一索引；状态是 `0待支付 1已支付 2已取消 3已关闭`。
+
+演示账号仍由 `config/DataInitializer` 启动时创建（密码要 BCrypt，写不死在 SQL 里）：
+**`admin / admin123`（ADMIN）**、**`user01 / user1234`（USER）**。
+本版它还会多干一件事：检查演示秒杀活动
+「AirPods Pro 3 限时秒杀」（商品 6、999.00、50 件、2 小时窗口），
+不存在就建、**窗口过期了就往后顺延**（方便随时演示），并顺手调一次预热 ——
+**预热失败只记日志不抛异常**，保证「虚拟机 Docker 还没起」时应用照样能启动。
+
+---
+
+## 四、目录结构
+
+### 后端（相比 v2.0 新增 / 改动的部分）
+
+```
+util/           RedisKeys         ★ 新增：所有 Redis key 集中命名
+                JsonUtil          ★ 新增：Jackson 3 序列化收敛（toJson / fromJson / tryFromJson）
+                BizAssert         ★ 新增：参数断言（isTrue / notNull / notEmpty）
+                OrderNoGenerator  ★ 新增：订单号生成（next / nextSeckill → SK 前缀）
+                PageUtil          （v2.0 已有）
+lock/           RedissonClientProvider  ★ 新增：懒初始化 RedissonClient，DisposableBean
+                RedissonLockTemplate    ★ 新增：executeWithLock 模板（等待/租约显式传参）
+config/         RedissonProperties      ★ 新增
+                SeckillProperties       ★ 新增
+                RabbitMQConfiguration   ★ 新增：2 交换机 + 4 队列 + 绑定
+                WebSocketConfiguration  ★ 新增：/ws/seckill
+                SecurityConfiguration   （改动：放行 /api/seckill/activity/** 与 /ws/**）
+                DataInitializer         （改动：新增 ensureDemoSeckill）
+entity/         SeckillActivity   ★ 新增（含 Phase 枚举 NOT_STARTED/RUNNING/ENDED）
+                SeckillOrder      ★ 新增（含 text() 状态文案）
+mapper/         SeckillActivityMapper  ★ 新增
+                SeckillOrderMapper     ★ 新增（selectUserIdsByActivity，预热时重建已购名单）
+dto/            SeckillActivityDTO     ★ 新增（@NotNull / @DecimalMin / @Min 校验）
+vo/             SeckillSnapshot        ★ 新增：活动快照（抢购链路零查库的关键）
+                SeckillActivityVO      ★ 新增
+                SeckillOrderVO         ★ 新增
+                SeckillResultVO        ★ 新增：结果码 QUEUED/SUCCESS/SOLD_OUT/DUPLICATE/FAILED/...
+                SeckillMonitorVO       ★ 新增：在线用户数 / 连接数
+                WebSocketMessageVO     ★ 新增：connected / pong / seckill 三类报文
+service/        SeckillStockService    ★ 新增（最大件）：三个 Lua 脚本的加载与封装
+                SeckillActivityService ★ 新增：CRUD + 预热 + DB 扣减/回补
+                SeckillOrderService    ★ 新增：TransactionTemplate 手写事务边界
+                SeckillService         ★ 新增：编排入口 seckill(userId, activityId)
+                SeckillDeductOutcome   ★ 新增：扣减结果 record + DeductResult 枚举
+                ProductCacheService    （改动：改用 RedisKeys + JsonUtil）
+                TokenBlacklistService  （改动：改用 RedisKeys）
+                OrderService           （改动：改用 BizAssert + OrderNoGenerator）
+security/       SecurityResponseWriter （改动：改用 JsonUtil）
+common/exception/  ErrorCode           （改动：新增 9 个秒杀错误码 + SERVICE_UNAVAILABLE）
+                   GlobalExceptionHandler （改动：新增 Redis/RabbitMQ 异常 → 503）
+mq/             SeckillMessage          ★ 新增：消息体 + Correlation 解析
+                SeckillProducer         ★ 新增：Confirm/Returns 回调 + 失败回补库存
+                SeckillOrderConsumer    ★ 新增：异步落库 + 投延迟消息 + 推送结果
+                SeckillReleaseConsumer  ★ 新增：延迟消息到期后关单释放库存
+websocket/      SeckillWebSocketHandler ★ 新增：会话管理 + 按用户推送
+                WebSocketAuthInterceptor ★ 新增：握手时用 ?token= 鉴权
+                SeckillNotifier         ★ 新增：推送入口（业务层只调它）
+controller/     SeckillController      ★ 新增：前台
+                AdminSeckillController  ★ 新增：后台
+src/main/resources/lua/  seckill_deduct.lua   ★ 新增：原子扣减
+                         seckill_release.lua  ★ 新增：释放（事务从未发生）
+                         seckill_refund.lua   ★ 新增：退还（事务发生后被取消）
+```
+
+### 前端
+
+本版**未改前端**（见第九章取舍：秒杀页面留到 v3.1）。
+
+---
+
+## 五、关键实现
+
+### 1. Redis + Lua 原子扣减（性能层）
+
+**为什么必须用 Lua**：如果不写脚本，Java 侧就要写成
+
+```
+GET  stock   → 判断 > 0   ┐
+SISMEMBER    → 判断未买   ├  这四步之间随时可能被其他线程插进来
+DECR stock                │  → 两个并发请求同时读到 stock=1，都判断通过 → 超卖
+SADD bought               ┘
+```
+
+Redis 执行 Lua 时**是单线程、不被打断的**，所以把这一整段塞进脚本，
+就等价于「一次不可分割的操作」。这是本版性能层的地基。
+
+**脚本返回值协议**（`seckill_deduct.lua`）：
+
+| 返回 | 含义 | Java 侧映射 |
+| --- | --- | --- |
+| `>= 0` | 扣减成功，值是**剩余库存** | `DeductResult.SUCCESS` |
+| `-1` | 售罄 | `SOLD_OUT` |
+| `-2` | 该用户已抢过 | `DUPLICATE` |
+| `-3` | 活动未预热（key 不存在） | `NOT_READY` |
+
+**一个容易写错的顺序**：脚本里**先** `SISMEMBER` 查「是否已抢」**再**查库存。
+反过来的话，一个已经抢到过的用户再点一次，会收到「已售罄」而不是「你已经抢到过了」——
+语义是错的（他明明抢到了）。
+
+**脚本干的五件事**（一次往返完成）：
+
+```lua
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return -2 end   -- 已抢
+if not redis.call('EXISTS', KEYS[1])            then return -3 end     -- 未预热
+local stock = tonumber(redis.call('GET', KEYS[1]))
+if stock <= 0 then return -1 end                                       -- 售罄
+redis.call('DECR', KEYS[1])                                            -- 扣减
+redis.call('SADD', KEYS[2], ARGV[1])                                   -- 记账
+redis.call('EXPIRE', KEYS[2], ARGV[2])                                 -- ★ 给已购集合设 TTL
+return stock - 1
+```
+
+> ★ 那句 `EXPIRE` 是修一个隐蔽 bug：不设 TTL 的话，**第一个抢到的人会创建一个永久 key**，
+> 活动结束后这个 Set 会一直留在 Redis 里。TTL 取 `result-ttl-seconds`（1 小时）。
+
+**「抢购链路零查库」**：活动信息（商品名、原价、时间窗口）在**预热**时一次性写成
+`seckill:activity:{id}` 快照，之后每个抢购请求只读这一份，**一次数据库都不查**。
+后台改活动 / 改商品时删掉这个快照即可（`evictSnapshot`）。
+
+**预热**（`SeckillStockService.preheat`）：
+持**整活动锁**执行，把 DB 库存写进 `seckill:stock:{id}`，
+并且**从 `seckill_order` 表反查已购用户重建 `seckill:bought:{id}` 集合** ——
+这样即使 Redis 被 `FLUSHALL`，预热一次也能恢复出正确状态，不会让老用户重复抢到。
+多实例同时启动时只会有一个人在刷。
+
+**Redis 不可用时**：`tryDeduct` **永不抛异常**，而是返回 `REDIS_UNAVAILABLE`，
+由 `SeckillService` 决定走降级还是直接 503。这样「Redis 抖动」被限制在一条分支里，
+不会以异常形式炸穿整个调用栈。
+
+### 2. RabbitMQ 异步落库削峰（削峰层）
+
+**为什么能削峰**：抢购成功后，请求只做「投一条消息」就返回了，
+真正的数据库写入由消费者按自己的节奏做。消费者的并发是
+`concurrency: 3 → max-concurrency: 10`，`prefetch: 1` ——
+**数据库看到的是每秒十几条的稳定写入，而不是上万条并发连接**。
+峰值被「摊平」成一条平缓的曲线，这就是削峰真正发生的地方。
+
+**拓扑**（`RabbitMQConfiguration`，2 交换机 + 4 队列）：
+
+| 名称 | 类型 | 作用 |
+| --- | --- | --- |
+| `seckill.exchange` | direct | 正常业务入口 |
+| `seckill.dlx.exchange` | direct | 死信交换机 |
+| `seckill.order.queue` | 队列 | 落库任务，绑 `seckill.order` |
+| `seckill.delay.queue` | 队列 | **延迟队列**，无消费者，绑 `seckill.delay`；带 `x-message-ttl` + `x-dead-letter-*` |
+| `seckill.order.dlq` | 队列 | 死信留痕，绑 `seckill.order.dlq` |
+| `seckill.release.queue` | 队列 | 延迟消息到期后被转发到这里，执行关单释放库存 |
+
+**延迟队列不引插件**：延迟队列上设了 `x-message-ttl = SECKILL_ORDER_DELAY_MS`
+和 `x-dead-letter-exchange = seckill.dlx.exchange`，消息在里面「躺」够 15 分钟
+就自动被投到 `seckill.release.queue`。**不需要 `rabbitmq_delayed_message_exchange` 插件**，
+部署省事。代价是：**TTL 是队列级参数，改了它必须把队列删掉重建**
+（RabbitMQ 拒绝参数不一致的重复声明），这点在 `application.yml` 里也写了注释。
+
+**手动 ACK 的理由**：`acknowledge-mode: manual` + `Channel.basicAck/basicNack`。
+用自动 ACK 的话，监听方法一返回消息就算「处理完了」，
+**数据库抖动那几分钟的失败会被整体丢掉**。手动 ACK 让确认时机由业务决定：
+
+```
+落库成功        → notifier.pushSeckillResult(SUCCESS) → publishDelay(超时关单) → basicAck
+落库抛异常      → stockService.releaseIfNotOrdered() → push(FAILED) → basicNack(requeue=false)
+消息解析失败    → basicAck 丢弃（坏消息没有重试价值，一直 requeue 会把队首卡死）
+```
+
+`default-requeue-rejected: false` 是关键：失败的消息**不回原队列**，
+由队列的 `x-dead-letter-*` 把它转进死信队列留痕。
+否则同一条坏消息会无限循环回到队首，把消费者彻底卡死。
+
+**Publisher Confirm + Returns（投递失败要回补库存）**：
+
+生产者上做了三件事：
+```java
+template.setMandatory(true);
+template.setConfirmCallback(this::onConfirm);
+template.setReturnsCallback(this::onReturned);
+```
+
+- `onConfirm`：Broker 确认收到消息。**未被确认**说明消息根本没进 Broker；
+- `onReturned`：消息进了 Broker 但**路由不到任何队列**（比如队列名被改了）。
+
+两种情况下，**Redis 里已经扣掉的库存必须还回去**，否则用户钱没花、库存却没了。
+靠 `CorrelationData` 里带的一段编码信息定位是哪个用户哪场活动：
+
+```
+Correlation = "kind:activityId:userId"      // 如 "order:1:5"
+```
+
+> ★ **只有 `KIND_ORDER` 才回补库存，`KIND_DELAY` 绝不回补。**
+> 延迟消息投递失败只意味着「这单不会自动关单」，用户还能手动取消；
+> 要是把它也当成扣减失败去 `INCR`，就会**凭空多出库存 —— 直接超卖**。
+
+`send(...)` 捕获 `AmqpException` 时也是同一套逻辑：回补库存 + 抛 `503`。
+
+### 3. Redisson 分布式锁兜底（正确性层）
+
+**三层冗余，任何一层单独失效都不足以超卖**：
+
+| 层 | 机制 | 失效场景 |
+| --- | --- | --- |
+| ① Redis+Lua | 单线程原子扣减 | Redis 挂了 / 被 FLUSH |
+| ② Redisson 用户锁 | 同一 (活动, 用户) 串行化 | 锁租期到了临界区还没跑完 |
+| ③ DB 兜底 | `UPDATE ... WHERE seckill_stock >= 1` + `UNIQUE (activity_id, user_id)` | ——（这层不会失效）|
+
+**锁必须在事务之外** —— 这是本版最值得说的一处设计。经典漏洞：
+
+```
+线程A: 加锁 → 开事务 → UPDATE 扣库存 → 提交事务 → 解锁
+线程B:                          ↑ 在线程A「提交」前抢到了锁（如果解锁在提交之前）
+                               → 读不到A写的数据 → 又扣了一次 → 超卖
+```
+
+正确顺序必须是 **加锁 → 开事务 → 提交 → 解锁**。
+同时还有一个 Java 语言的坑：**同类内部方法自调用（`this.xxx()`）不走代理，
+`@Transactional` 会静默失效**。
+
+两个问题用同一个解法解决：`SeckillOrderService` 里**手写 `TransactionTemplate`** 把事务边界显式画出来：
+
+```java
+// RedissonLockTemplate.executeWithLock(...) 内部
+lock.tryLock(wait, lease, SECONDS);
+try {
+    return transactionTemplate.execute(status -> persistLocked(message));  // 事务在这儿
+} finally {
+    releaseQuietly(lock);   // 锁在事务提交之后才释放
+}
+```
+
+`RedissonLockTemplate` 的细节：
+
+- `tryLock(waitSeconds, leaseSeconds, TimeUnit.SECONDS)` —— **显式传 leaseTime**，
+  不依赖看门狗自动续期（续期意味着锁可能被无限持有，临界区卡死时更危险）；
+- 拿到 `InterruptedException` 时**恢复中断标志**（`Thread.currentThread().interrupt()`），不吞掉；
+- `releaseQuietly` 先查 `isHeldByCurrentThread()` 再解锁 ——
+  避免「锁已经因为租期到了自动释放，然后去 unlock 别的线程持有的锁」；
+  同时**如果临界区耗时超过了租期会打 warn**，便于发现租期设小了。
+
+**降级链路**（`SECKILL_FALLBACK_ENABLED=true` 且 Redis 扣减不可用）：
+拿**整活动一把锁**，然后直接走数据库：`SeckillOrderService.persistDirectly`
+（这是一个真正的 `public @Transactional` 方法，从 `SeckillService` 调用，走代理）。
+**吞吐换正确性** —— 一场活动同一时刻只有一个人在下单，但绝不超卖。
+这比「Redis 一挂秒杀就整个不可用」体验好，也比「放开让数据库被打穿」安全。
+
+### 4. `release` 与 `refund`：两个容易混为一谈的操作
+
+这是本版**写代码过程中发现并修正的一个设计 bug**，值得单独说。
+
+一开始我把「订单超时关单」和「用户主动取消」都写成调用 `stockService.release()`，
+而 `release` 的执行是 `SREM`（把用户从已购集合里删掉）+ `INCR`（库存加回）。
+问题在于：**库存加回了、用户也能再抢了，但数据库里那条
+`(activity_id, user_id)` 唯一索引记录还在** ——
+用户重新抢购时会在落库阶段撞唯一键，报一个莫名其妙的错。
+
+根因是**两个语义完全不同的操作被合并成了一个**：
+
+| 操作 | 何时用 | Lua 动作 | 用户能否再抢 |
+| --- | --- | --- | --- |
+| **release（释放）** | 扣减成功但**事务从未发生**（消息投递失败 / 落库异常） | `SREM` + `INCR` | ✅ 能，因为根本没下过单 |
+| **refund（退还）** | 扣减成功、订单也落库了，**之后**才被取消 / 超时关单 | 只 `INCR` | ❌ 不能 —— 「一场活动一次机会」已经用掉了 |
+
+所以拆成了两个脚本：
+
+- `seckill_release.lua`：幂等。先 `SREM`，返回 0 说明本来就没记过这笔 → 返回 `-2` 直接结束，
+  不会出现「释放两次、库存多加一次」；
+- `seckill_refund.lua`：**只 `INCR`，保留已购标记**。文件头写了一段长注释解释这个区别，
+  免得以后有人「顺手统一一下」。
+
+并且给 `release` 加了一个保护 `releaseIfNotOrdered(activityId, userId)`：
+**先查数据库确认这单真的没落库**，才执行 `release`。
+因为消费者是异步的 —— 可能出现「消息投递报错走了回补，但同一条消息其实也已经进了队列并被消费成功」
+这种边界情况，此时无条件 `SREM` 就会把已购标记误删。
+
+### 5. WebSocket 实时推送
+
+**为什么用原生 WebSocket 不用 STOMP**：只有「服务端单向推结果给某个用户」这一个需求，
+不需要订阅/目的地那套模型。原生方案少一层协议、少一堆依赖，
+`TextWebSocketHandler` 一个类就够。
+
+**握手鉴权为什么走 `?token=`**：浏览器的 `new WebSocket(url)` **不能设置自定义请求头**，
+所以 `Authorization: Bearer` 这条路对浏览器走不通。改成 URL 查询参数：
+
+```
+ws://<host>:<port>/ws/seckill?token=<accessToken>
+```
+
+`WebSocketAuthInterceptor`（`HandshakeInterceptor`）在 `beforeHandshake` 里解析 token：
+浏览器走 `?token=`，非浏览器客户端仍支持 `Authorization` 头；
+解析 → 查库确认用户存在且未被禁用 → 把 `userId` 塞进 attributes。
+**任何一步失败就 `return false` 拒绝握手**，连接根本建立不起来。
+
+**会话管理**（`SeckillWebSocketHandler`）：`Map<Long, Set<WebSocketSession>>`，
+一个用户允许多端（多标签页 / 手机+电脑）各连一条。
+`afterConnectionClosed` 里要**顺手把空 Set 从 Map 里删掉**，否则 Map 会随用户数无限膨胀。
+
+**线程安全**：`WebSocketSession.sendMessage` **不是线程安全的**，
+多个消费者线程同时给同一个用户推消息会抛 `IllegalStateException`，
+所以 `send` 方法里用 `synchronized (session)` 串起来。
+
+**推送与查询的分工**：WebSocket 只是「通知」，**权威结果始终在 MySQL**。
+所以另配了 `GET /api/seckill/result/{activityId}` 作为兜底：
+断线重连、推送丢失、用户手动刷新都走它。
+
+### 6. `SeckillService.seckill()` 的完整编排
+
+```
+seckill(userId, activityId)
+ ├─ 读活动快照（Redis，miss 则回源并回写缓存）
+ ├─ 时间窗口校验：未开始 → SECKILL_NOT_STARTED / 已结束 → SECKILL_ENDED
+ ├─ 已有订单校验（先查 DB）—— 老用户友好提示，不用等 Lua 的 -2
+ ├─ stockService.tryDeduct(activityId, userId)      ← ★ Lua 原子扣减
+ │    ├─ SUCCESS        → enqueue(...)
+ │    ├─ SOLD_OUT       → SeckillResultVO.SOLD_OUT
+ │    ├─ DUPLICATE      → duplicateResult(...)   （带出已有订单号）
+ │    ├─ NOT_READY      → 现场预热一次 → 重试；仍失败 → SECKILL_NOT_READY
+ │    └─ REDIS_UNAVAILABLE → fallback-enabled ? fallbackDeduct(...) : 503
+ ├─ enqueue(...)：
+ │    ① ★ 先写 QUEUED 结果缓存   ② 再 publishOrder 投 MQ
+ └─ 返回 QUEUED（result = 0）
+```
+
+> ★ **①必须写在 ②之前**。顺序反了的话：消费者可能极快地落库完成并写入 SUCCESS 缓存，
+> 然后这边那句迟到的 QUEUED 写入**把 SUCCESS 覆盖掉**，
+> 用户刷新页面看到的是「排队中」，而实际已经抢到了。
+
+`queued-ttl-seconds` 只给 2 分钟也是刻意的：万一消息真丢了（且没有触发回补），
+缓存自己会过期，之后查询会**如实回答「没有记录」**，而不是一直骗用户「正在处理」。
+
+### 7. 代码治理与 util 提炼（本版同批次完成）
+
+| 治理项 | 之前 | 现在 |
+| --- | --- | --- |
+| Redis key | 每个类各写一份 `private static final String KEY_PREFIX`，键名散在四处 | 全部收敛到 `util/RedisKeys`，一处看清整个键空间 |
+| JSON | `ProductCacheService` / `SecurityResponseWriter` 各自 new ObjectMapper | `util/JsonUtil`（`toJson` / `toJsonBytes` / `fromJson` / `tryFromJson`） |
+| 参数校验 | 到处都是 `if (x == null) throw new BusinessException(...)` | `util/BizAssert.isTrue / notNull / notEmpty`（支持 `Supplier<String>` 懒拼消息） |
+| 订单号 | `OrderService` 的私有 `generateOrderNo()` | `util/OrderNoGenerator`，秒杀订单复用并换 `SK` 前缀 |
+
+`RedisKeys` 里顺带定了两条约定：
+
+- **冒号分层** `业务:对象:标识`，redis-cli 里 `SCAN seckill:*` 能按业务域过滤；
+- **键名不带 TTL 语义**，TTL 由写入方决定，键名只管「是什么」。
+
+注意：v2.0 已经在跑的 `product:` 和 `jwt:blacklist:` 两个前缀**刻意保持原样**，
+避免升级后旧 key 全部失效。另外 `RedisKeys.sanitize()` 对拼进键名的片段做白名单校验
+（1~64 个可见 ASCII 字符），防止换行/空格/通配符污染 SCAN 结果和日志。
+
+`JsonUtil` 分两个方法是有意的：`fromJson` 解析失败抛
+`BusinessException(INVALID_ARGUMENT)`（调用方确实需要这个值），
+`tryFromJson` 返回 `Optional`（缓存读取场景，读坏了应该当作 miss 而不是报错）。
+
+---
+
+## 六、接口清单
+
+### 前台秒杀 `/api/seckill`
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/seckill/activity/page?pageNum=&pageSize=` | 否 | 秒杀活动分页（只含已发布） |
+| GET | `/api/seckill/activity/{id}` | 否 | 活动详情 |
+| POST | `/api/seckill/activity/{activityId}/grab` | 是 | **抢购**。返回 `result=0` 排队中是正常的 |
+| GET | `/api/seckill/result/{activityId}` | 是 | 查自己的结果（WebSocket 的兜底路径） |
+| GET | `/api/seckill/order/page?pageNum=&pageSize=&status=` | 是 | 我的秒杀订单分页 |
+| PUT | `/api/seckill/order/{id}/pay` | 是 | 支付（模拟）：0 → 1 |
+| PUT | `/api/seckill/order/{id}/cancel` | 是 | 取消：0 → 2，退还库存（**但这场活动不能再抢了**） |
+
+**`SeckillResultVO.result` 取值**（前端按它决定展示文案）：
+
+| 值 | 枚举 | 含义 |
+| --- | --- | --- |
+| 0 | `QUEUED` | 排队中，等 WebSocket 推送 |
+| 1 | `SUCCESS` | 抢购成功 |
+| 2 | `SOLD_OUT` | 已售罄 |
+| 3 | `DUPLICATE` | 你已经抢到过了 |
+| 4 | `FAILED` | 落库失败（已回补库存） |
+| 5 / 6 | `NOT_STARTED` / `ENDED` | 未开始 / 已结束 |
+| 7 | `EXPIRED` | 超时未支付，订单已关闭 |
+| 8 | `CANCELLED` | 订单已取消 |
+
+### 后台秒杀管理 `/api/admin/seckill`（需 `ROLE_ADMIN`）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/admin/seckill/page?pageNum=&pageSize=&status=` | 活动分页（含已下线） |
+| GET | `/api/admin/seckill/{id}` | 活动详情 |
+| POST | `/api/admin/seckill` | 新增活动 |
+| PUT | `/api/admin/seckill/{id}` | 修改（**改库存不会同步 Redis，需再调一次预热点重置**） |
+| DELETE | `/api/admin/seckill/{id}` | 删除 |
+| PUT | `/api/admin/seckill/{id}/status?status=1` | 上下线（1 已发布 / 0 已下线） |
+| POST | `/api/admin/seckill/{id}/preheat?force=` | **预热**。`force=true` 用 DB 库存强制覆盖 Redis |
+| GET | `/api/admin/seckill/{id}/stock` | 看 Redis 实时库存 vs DB 库存（快速判断两边是否一致） |
+| GET | `/api/admin/seckill/monitor` | 秒杀链路在线情况（WebSocket 在线用户数 / 连接数） |
+
+### WebSocket
+
+| 地址 | 说明 |
+| --- | --- |
+| `ws://<host>:<port>/ws/seckill?token=<accessToken>` | 握手鉴权，失败直接拒绝连接 |
+
+报文三类（`type` 字段区分）：
+
+```jsonc
+// 1) 连接建立
+{"type": "connected", "data": {"userId": 5}}
+// 2) 心跳（客户端发 "ping" 文本，服务端回）
+{"type": "pong", "data": null}
+// 3) 秒杀结果（data 就是 SeckillResultVO）
+{"type": "seckill", "data": {"activityId":1,"orderNo":"SK...","result":1,"resultText":"抢购成功", "...": "..."}}
+```
+
+### 本版新增的错误码
+
+| 码 | HTTP | 说明 |
+| --- | --- | --- |
+| `40009` | 404 | 秒杀活动不存在 |
+| `40010` | 409 | 秒杀未开始 |
+| `40011` | 409 | 秒杀已结束 |
+| `40012` | 409 | 已售罄 |
+| `40013` | 409 | 重复抢购 |
+| `40014` | 404 | 秒杀订单不存在 |
+| `40015` | 409 | 订单状态不允许此操作 |
+| `40016` | 409 | 活动未就绪（未预热且现场预热失败） |
+| `50301` | 503 | 依赖服务不可用（Redis / RabbitMQ 异常，`GlobalExceptionHandler` 里新加了两条 `@ExceptionHandler`） |
+
+---
+
+## 七、跑起来（★ 本章是虚拟机 Docker + SSH 的完整连接过程）
+
+拓扑是这样的：
+
+```
+┌─────────────────────────────┐          ┌──────────────────────────────────────┐
+│  宿主机（写代码 / 跑后端）    │  SSH     │  虚拟机                              │
+│                             │ ───────► │  ┌────────────────────────────────┐  │
+│  Spring Boot :8080          │          │  │ Docker                         │  │
+│                             │  6379    │  │  ├─ redis      :6379           │  │
+│  ←──────────────────────────┼──────────┼──┤  └─ rabbitmq   :5672 / :15672  │  │
+│                             │  5672    │  └────────────────────────────────┘  │
+└─────────────────────────────┘          └──────────────────────────────────────┘
+```
+
+**要点**：Docker 跑在虚拟机里，但**后端跑在宿主机**。
+所以既要能从宿主机「驱动虚拟机的 Docker」（走 SSH），
+又要能从宿主机「直连虚拟机里容器暴露出来的端口」（走 TCP，需要端口发布 + 防火墙放行）。
+这两件事用的是**两条不同的通道**，别混淆。
+
+### 步骤 0：确认虚拟机能 SSH 进来
+
+```bash
+ssh <用户>@<虚拟机IP>            # 例：ssh root@192.168.1.100
+```
+
+进不去的话先把 SSH 服务、网卡、防火墙搞定。后面所有命令要么在虚拟机里执行（方式A），
+要么在宿主机上带 `DOCKER_HOST=ssh://...` 执行（方式B）。
+
+### 步骤 1：在虚拟机上装 Docker
+
+```bash
+# 方式 1：官方脚本（最省事）
+curl -fsSL https://get.docker.com | sh
+
+# 方式 2：国内网络慢的话用镜像加速脚本
+# curl -fsSL https://get.docker.com | sh -s docker --mirror Aliyun
+
+# 启动 + 开机自启
+sudo systemctl enable --now docker
+
+# 验证（要能打印版本，且 docker compose 子命令可用）
+docker version
+docker compose version
+sudo docker run --rm hello-world
+```
+
+> 如果**不用 root 登录**，把当前用户加进 docker 组，免得每条命令都要 sudo：
+> ```bash
+> sudo usermod -aG docker $USER
+> # 然后重新登录（或 newgrp docker）才生效
+> ```
+>
+> 如果虚拟机是 **CentOS / RHEL / 麒麟** 这类用 `yum`/`dnf` 的系统，官方脚本同样支持；
+> 装不上时按发行版文档加 Docker CE 的 yum/dnf 源即可。
+>
+> Compose 用的是 **`docker compose`（v2 子命令）**，不是老的 `docker-compose`（v1 独立二进制）。
+> 如果只有 v1，装一下 v2 插件（Debian/Ubuntu：`sudo apt install docker-compose-v2`）。
+
+### 步骤 2：把项目传到虚拟机上并准备 `.env`
+
+`docker-compose.yml` 和 `.env` 要放在同一目录（compose 会自动读同目录的 `.env`）。
+
+```bash
+# 方式 1：只传这两个文件（推荐，后端代码留在宿主机跑）
+scp docker-compose.yml .env.example <用户>@<虚拟机IP>:/opt/novamart/
+# 在虚拟机上：
+ssh <用户>@<虚拟机IP>
+cd /opt/novamart
+cp .env.example .env
+vi .env                     # ★ 必须改掉所有默认密码
+```
+
+`.env.example` 里的变量（复制成 `.env` 后按需修改）：
+
+```dotenv
+# ---- Redis ----
+REDIS_PASSWORD=改成你自己的强密码
+REDIS_PORT=6379
+REDIS_MAXMEMORY=512mb
+REDIS_IMAGE=redis:7-alpine
+
+# ---- RabbitMQ ----
+RABBITMQ_USERNAME=novamart
+RABBITMQ_PASSWORD=改成你自己的强密码
+RABBITMQ_VHOST=novamart
+RABBITMQ_PORT=5672
+RABBITMQ_MANAGEMENT_PORT=15672
+RABBITMQ_IMAGE=rabbitmq:4-management
+```
+
+> ★ 三个**必须前后一致**的地方（不一致会表现为「消费者起不来 / 消息全部路由失败」）：
+> 1. `.env` 的 `RABBITMQ_VHOST` ↔ 后端 `RABBITMQ_VHOST`
+>    （compose 里用 `RABBITMQ_DEFAULT_VHOST` 传给镜像，非 `/` 时镜像会自动创建该 vhost）
+> 2. `.env` 的 `REDIS_PASSWORD` ↔ 后端 `REDIS_PASSWORD`
+> 3. `.env` 的 `RABBITMQ_USERNAME` / `RABBITMQ_PASSWORD` ↔ 后端同名变量
+>
+> `.env` 里是明文密码，已经加进 `.gitignore`，**不要提交**。
+
+### 步骤 3：启动中间件
+
+**方式 A（推荐，先在虚拟机上直接起一遍，确认没问题）**：
+
+```bash
+ssh <用户>@<虚拟机IP>
+cd /opt/novamart
+docker compose up -d
+```
+
+**方式 B（在宿主机上通过 SSH 直接驱动虚拟机的 Docker）** —— 这就是「通过宿主机 SSH 虚拟机里的 Docker」：
+
+```bash
+# 1) 先建一个指向虚拟机的 docker context（只需做一次）
+docker context create novamart-vm --docker "host=ssh://<用户>@<虚拟机IP>"
+
+# 2) 切过去，之后所有 docker / docker compose 命令都打在虚拟机上
+docker context use novamart-vm
+
+# 3) 起服务（在宿主机上执行，容器实际跑在虚拟机里）
+cd /d/lanqiaoforwork/code/NovaMart      # 或 .env / compose 文件所在目录
+docker compose up -d
+
+# 4) 用完想切回本机 Docker
+docker context use default
+```
+
+也可以不切 context，**一条命令临时指过去**：
+
+```bash
+DOCKER_HOST=ssh://<用户>@<虚拟机IP> docker compose up -d
+# 后面所有 docker compose xxx 命令都要带这个前缀，忘了就会打到本机 Docker 上
+```
+
+> 用 context 的好处就是「不用每条命令都加前缀」，不容易忘。
+> `docker context ls` 能看到当前用的是哪个。
+
+### 步骤 4：验证中间件起来了
+
+```bash
+# 容器状态，两个都应该是 running (healthy)
+docker compose ps
+
+# 看日志（首次启动 RabbitMQ 要 30s 左右才 healthy）
+docker compose logs -f redis
+docker compose logs -f rabbitmq
+
+# Redis 连通性（在虚拟机上执行）
+docker exec -it novamart-redis redis-cli -a "<REDIS_PASSWORD>" ping      # 期望 PONG
+
+# 顺便确认淘汰策略真的是 noeviction（★ 这是正确性要求，不是调优）
+docker exec -it novamart-redis redis-cli -a "<REDIS_PASSWORD>" config get maxmemory-policy
+# 期望输出：maxmemory-policy  noeviction
+```
+
+**RabbitMQ 管理界面**：浏览器打开 `http://<虚拟机IP>:15672`，
+用 `.env` 里的 `RABBITMQ_USERNAME` / `RABBITMQ_PASSWORD` 登录，
+在 **Queues** 页把 vhost 切到 `novamart`，**应用首次启动后**应当能看到自动声明出的 4 个队列：
+`seckill.order.queue`、`seckill.delay.queue`、`seckill.order.dlq`、`seckill.release.queue`。
+
+> 队列是**应用启动时由 `RabbitAdmin` 声明**的，所以刚 `up -d` 完还没起后端时，
+> Queues 页是空的 —— 这是正常的，不是配错了。
+
+### 步骤 5：虚拟机端口 / 防火墙放行（★ 最容易漏的一步）
+
+容器端口发布到虚拟机上了，但如果虚拟机防火墙不放行，宿主机依然连不上。
+**只需要放行给宿主机所在网段**（管理端口 15672 按需，或只给自己那台机器）：
+
+```bash
+# firewalld（CentOS / RHEL / 麒麟）
+sudo firewall-cmd --permanent --add-port=6379/tcp
+sudo firewall-cmd --permanent --add-port=5672/tcp
+sudo firewall-cmd --permanent --add-port=15672/tcp        # 管理界面，按需
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-ports
+
+# ufw（Ubuntu / Debian）
+sudo ufw allow from 192.168.1.0/24 to any port 6379 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 5672 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 15672 proto tcp
+sudo ufw reload
+```
+
+同时确认**虚拟机网卡模式**：
+
+- **NAT**（VMware / VirtualBox 默认）→ 宿主机**连不上**虚拟机的发布端口，两个办法：
+  ① 在虚拟机软件里加一条**端口转发** 6379 / 5672 / 15672 → 虚拟机 IP；
+  ② 或干脆把网卡改成**桥接模式**，虚拟机拿到独立局域网 IP，宿主机直接访问；
+- **桥接** → 直接用虚拟机的局域网 IP，最简单，**推荐**。
+
+在宿主机上验证端口通不通（Windows 下可能没装 `telnet`，用下面任一种）：
+
+```bash
+telnet <虚拟机IP> 6379
+# 或
+nc -vz <虚拟机IP> 6379      # 期望 succeeded!
+
+# Redis 直连测试（宿主机有 redis-cli 的话）
+redis-cli -h <虚拟机IP> -p 6379 -a "<REDIS_PASSWORD>" ping    # 期望 PONG
+```
+
+### 步骤 6：数据库
+
+中间件在虚拟机，**MySQL 按 v2.0 的老做法跑**（本机或虚拟机都行，用 `DB_URL` 指过去）。
+
+```bash
+# 全新安装
+mysql --default-character-set=utf8mb4 -uroot -p < src/main/resources/db/schema.sql
+
+# 从 v2.0 老库升级（★ 可重复执行，不会重复插数据）
+mysql --default-character-set=utf8mb4 -uroot -p < src/main/resources/db/upgrade_v3.sql
+```
+
+升完 `upgrade_v3.sql` 它在最后会提示你去做一次预热（见步骤 8）。
+
+### 步骤 7：在宿主机上启动后端
+
+**只有这一步是本机跑的**，其余中间件都在虚拟机。关键是把三组环境变量指到虚拟机 IP：
+
+```bash
+# 本机 MySQL 的话 DB_* 不用改
+export DB_URL='jdbc:mysql://localhost:3306/novamart?useUnicode=true&characterEncoding=utf8&serverTimezone=GMT%2B8'
+export DB_USERNAME=root
+export DB_PASSWORD=<你的MySQL密码>
+
+# ★ 指向虚拟机
+export REDIS_HOST=<虚拟机IP>
+export REDIS_PORT=6379
+export REDIS_PASSWORD=<.env 里的 REDIS_PASSWORD>
+
+export RABBITMQ_HOST=<虚拟机IP>
+export RABBITMQ_PORT=5672
+export RABBITMQ_USERNAME=<.env 里的 RABBITMQ_USERNAME>
+export RABBITMQ_PASSWORD=<.env 里的 RABBITMQ_PASSWORD>
+export RABBITMQ_VHOST=<.env 里的 RABBITMQ_VHOST>     # ★ 必须一致
+
+# 秒杀参数（可选，不设就用默认值）
+export SECKILL_ORDER_DELAY_MS=900000
+export SECKILL_FALLBACK_ENABLED=true
+
+mvn spring-boot:run
+```
+
+> ⚠️ 当前 `pom.xml` **没有 `<build>` 段**（v2.0 起就是这样），
+> 所以 `mvn spring-boot:run` / `java -jar` 都用不了（打出来的 jar 没有主清单属性）。
+> 本版编译验证是用 `mvn -DskipTests compile`；
+> 要真启动可以临时把 `spring-boot-maven-plugin` 加回 `<build><plugins>`，
+> 或者用 `java -cp "target/classes;<mvn dependency:build-classpath 的输出>" com.example.novamart.NovaMartApplication`。
+
+启动日志里应当看到：
+
+```
+Tomcat started on port 8080
+... RabbitAdmin ... 声明 seckill.order.queue / seckill.delay.queue / seckill.order.dlq / seckill.release.queue
+```
+
+### 步骤 8：预热活动 + 冒烟测试
+
+```bash
+# 1) 登录拿 token
+ACCESS=$(curl -s --noproxy '*' -X POST http://localhost:8080/api/user/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"user01","password":"user1234"}' | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4)
+
+# 2) 看演示活动（DataInitializer 启动时已建好，并尝试预热过）
+curl -s --noproxy '*' "http://localhost:8080/api/seckill/activity/page?pageNum=1&pageSize=10"
+
+# 3) 显式预热一次（force=true 用 DB 库存强制覆盖 Redis）
+ADMIN=$(curl -s --noproxy '*' -X POST http://localhost:8080/api/user/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4)
+curl -s --noproxy '*' -X POST "http://localhost:8080/api/admin/seckill/1/preheat?force=true" \
+  -H "Authorization: Bearer $ADMIN"
+
+# 4) 对账：Redis 库存 vs DB 库存（两个数应当相等）
+curl -s --noproxy '*' http://localhost:8080/api/admin/seckill/1/stock \
+  -H "Authorization: Bearer $ADMIN"
+
+# 5) 抢购
+curl -s --noproxy '*' -X POST http://localhost:8080/api/seckill/activity/1/grab \
+  -H "Authorization: Bearer $ACCESS"
+
+# 6) 查结果（抢购返回「排队中」后稍等一两秒再查，应变成「抢购成功」）
+curl -s --noproxy '*' http://localhost:8080/api/seckill/result/1 \
+  -H "Authorization: Bearer $ACCESS"
+```
+
+> 注意 `curl` 访问 localhost 要加 `--noproxy '*'`，
+> 否则会被本机代理拦成 502（这个坑 v2.0 就踩过）。
+
+### 步骤 9：WebSocket 联调
+
+```bash
+# 装个 wscat 方便测试（或直接用浏览器控制台）
+npx wscat -c "ws://localhost:8080/ws/seckill?token=$ACCESS"
+```
+
+连上应当立刻收到 `{"type":"connected","data":{"userId":...}}`；
+发 `ping` 应收回 `{"type":"pong","data":null}`。
+保持这个连接，另开一个终端执行步骤 8 的第 5 步抢购，
+**抢购成功的结果会直接推到这个连接上**（`{"type":"seckill", ...}`）。
+
+浏览器里更简单的写法（F12 控制台）：
+
+```js
+const ws = new WebSocket('ws://localhost:8080/ws/seckill?token=' + localStorage.token)
+ws.onmessage = e => console.log(JSON.parse(e.data))
+```
+
+### 常用运维命令
+
+```bash
+# 全部停掉（数据保留在命名卷里）
+docker compose stop
+docker compose down              # 删容器和网络，卷保留
+
+# ★ 彻底清库重来（会删掉 Redis AOF 和 RabbitMQ 数据，仅演示用）
+docker compose down -v
+
+# 只重启某一个
+docker compose restart redis
+
+# 改过 SECKILL_ORDER_DELAY_MS 之后 ★ 必须删掉延迟队列让它重建
+#   （队列级 TTL 是队列参数，RabbitMQ 拒绝参数不一致的重复声明）
+docker exec -it novamart-rabbitmq rabbitmqctl -p novamart delete_queue seckill.delay.queue
+# 然后重启后端，RabbitAdmin 会用新参数重新声明
+```
+
+---
+
+## 八、实测结果
+
+**本章如实说明：本版没有做端到端实测。**
+
+原因是本版的运行前提就是「Redis 和 RabbitMQ 跑在虚拟机 Docker 里」——
+在写代码这台机器上**既没有可达的虚拟机，也没有这两个中间件**，
+所以拿不到真实的运行数据。这一章不编数字，只写**已经验证过的**和**需要你按第七章验证的**。
+
+### 已经验证的
+
+| 项 | 结论 |
+| --- | --- |
+| 编译 | `mvn -q -DskipTests -Dfile.encoding=UTF-8 compile` → **exit 0，无报错** |
+| 依赖解析 | `spring-boot-starter-amqp`、`spring-boot-starter-websocket`、`redisson 4.8.0` 全部从阿里云镜像解析成功，落到本地仓库 `D:\path\to\local\repo` |
+| API 签名核对 | 所有用到的 Redisson / Spring AMQP / Spring WebSocket 方法**逐个用 `javap` 反编译核对过**（见第九章说明），不是凭记忆写的 |
+| Lua 脚本 | 三个脚本随 `DefaultRedisScript` 从 classpath 加载，编译期已确认资源路径可达 |
+| 修复的编译错误 | `SeckillProducer` 里 `ifPresent(this::releaseIfNeeded)` 参数个数不匹配（方法签名是 `(Correlation, String)`），已改成 lambda 显式传第二个参数 |
+
+### 需要你按第七章验证的（建议顺序）
+
+| 步骤 | 怎么做 | 期望 |
+| --- | --- | --- |
+| 1. 基础连通 | `docker compose ps` | 两个服务 `running (healthy)` |
+| 2. Redis 策略 | `redis-cli ... config get maxmemory-policy` | `noeviction` |
+| 3. 队列声明 | 起后端后看 RabbitMQ 管理界面 Queues | 4 个队列都在 `novamart` vhost 下 |
+| 4. 预热对账 | `GET /api/admin/seckill/1/stock` | `redisStock == dbStock` |
+| 5. 正常抢购 | 步骤 8 的第 5、6 步 | 先「排队中」，约 1 秒后变「抢购成功」 |
+| 6. WebSocket | 步骤 9 | 连上收到 `connected`；抢购成功时收到 `seckill` 推送 |
+| 7. **重复抢购** | 同一用户再抢一次 | `result=3 DUPLICATE`，DB 里仍只有一条 `(activity_id, user_id)` |
+| 8. **并发不超卖** | 把库存改成 5，然后用 20 个账号并发抢 | **恰好 5 个成功**，`seckill_stock` 停在 0，**绝不出现负数** |
+| 9. **超时关单** | 抢到不支付，把 `SECKILL_ORDER_DELAY_MS` 临时调小（如 10000）重跑 | 约 10 秒后订单变「已关闭」，库存 +1 |
+| 10. **取消后不能复抢** | 抢到 → 取消 → 再抢 | 退还库存成功，但再抢返回 `DUPLICATE`（`uk_seckill_order_user` 还在） |
+| 11. **Redis 降级** | 停掉 redis 容器再抢 | `SECKILL_FALLBACK_ENABLED=true` 时走锁+DB 降级仍能抢到；设 `false` 则返回 503 |
+| 12. **消息堆积** | 压测时看管理界面 | `seckill.order.queue` 的 Ready 数上升但**消费速率恒定** —— 这就是削峰 |
+
+> 第 8 步是**本版最该验证的一条**。它是三层冗余设计的验收标准：
+> 无论中间层怎么失效，`seckill_stock` 都不能变成负数，
+> 且 `seckill_order` 里同一 `(activity_id, user_id)` 只能有一行。
+
+---
+
+## 九、已知取舍
+
+### 正确性相关的取舍（重要）
+
+1. **`noeviction` 是硬要求**。Redis 内存满了会**写失败**而不是淘汰数据。
+   演示项目里内存给 512MB 够用；生产环境要根据活动量估算，
+   或者把库存 key 单独放到不设 maxmemory 的实例上。
+
+2. **「一场活动一次机会」，取消后不能重新抢**。这是
+   `uk_seckill_order_user (activity_id, user_id)` 唯一索引的直接后果 ——
+   用了「退还库存但保留订单记录」的方案（`seckill_refund.lua`），
+   换来的是**数据库层面绝对不可能出现一人两单**。
+   要支持「取消后可复抢」，就得把唯一索引改成「只对未取消状态唯一」，
+   而 MySQL 的唯一索引做不到条件唯一，需要加一列辅助或改用应用层锁 —— 本版不做。
+
+3. **降级链路会明显变慢**。`fallbackDeduct` 拿的是**整活动一把锁**，
+   同一时刻只有一个请求在下单。这是刻意的：**拿吞吐换「绝不超卖」**。
+   如果更看重可用性，可以调大 `SECKILL_ACTIVITY_LOCK_LEASE_SECONDS`
+   或干脆把 `SECKILL_FALLBACK_ENABLED` 设成 `false`（Redis 挂了直接 503）。
+
+4. **`SECKILL_ORDER_DELAY_MS` 改了要重建延迟队列**。队列级 TTL 是队列参数，
+   RabbitMQ 拒绝参数不一致的重复声明，所以必须先
+   `rabbitmqctl -p novamart delete_queue seckill.delay.queue`。
+
+5. **延迟消息有精度上限**。队列级 TTL + DLX 的机制是「消息到队头才判过期」，
+   所以**延迟时间不精确**（可能有秒级偏差，且严格来说同队列内长 TTL 会阻塞短 TTL）。
+   本场景只有一种延迟时长（15 分钟关单），所以不受这个特性影响；
+   要多种延迟时长共存，就该上 `rabbitmq_delayed_message_exchange` 插件。
+
+6. **消费失败的消息进死信队列后没有自动重投**。目前 `seckill.order.dlq`
+   只是「留痕」，需要人工介入（看管理界面 → 确认原因 → 手动重投）。
+   加自动重试（带退避）会更完整，本版没做。
+
+7. **WebSocket 是单机会话表**。`sessionsByUser` 在 JVM 内存里，
+   多实例部署时「A 实例的消费者完工、用户在 B 实例上」推不到。
+   要支持集群得引 Redis Pub/Sub 或 STOMP broker relay 做广播 —— 本版没做。
+
+8. **`send` 用 `synchronized (session)` 串行化**，单个连接的推送吞吐有上限。
+   对一个用户的推送量本来就不大，够用；真要做高频推送应该换成带队列的异步发送。
+
+### 范围与体量上的取舍
+
+9. **前端秒杀页面没做**。本版只交付后端 + 配置 + 本文档
+   （原始要求就是「只用写 springboot 里面的代码和配置」）。
+   WebSocket 的客户端写法在第七章步骤 9 里给了可直接粘的代码。
+   规划中的 v3.1：`SeckillView`（活动列表 + 倒计时 + 抢购按钮）、
+   `SeckillManageView`（后台活动管理 + 预热）、`utils/seckillSocket.js`（含断线重连）。
+
+10. **秒杀订单和普通订单分两张表**。「我的订单」要查两张表，
+    本版**没有做统一视图**，秒杀订单走独立的 `/api/seckill/order/page`。
+    合并需要引入视图或中间表，收益不明显，暂不做。
+
+11. **秒杀订单数量固定 1**。表里有 `quantity` 列但恒为 1，不支持「一次抢 N 件」。
+    要支持的话 Lua 脚本要从 `DECR 1` 改成 `DECRBY n` 并在扣减前校验 `stock >= n`。
+
+12. **`seckill:bought:{id}` 集合重建依赖全表扫描**。
+    `preheat` 里用 `selectUserIdsByActivity` 把该活动的所有买家拉出来重建集合，
+    活动大到十万单量级时这一步会慢。届时应该改成从 Redis 反向恢复（定期 RDB/AOF 备份），
+    或分片存储。
+
+13. **`mvn spring-boot:run` / `java -jar` 仍然不可用**（`pom.xml` 没有 `<build>` 段，
+    从 v2.0 起就是这样）。本版没有擅自加回去，因为不确定那是不是有意去掉的。
+    要恢复可执行 jar，把 `spring-boot-maven-plugin` 加回 `<build><plugins>` 即可。
+
+### 开发过程上的说明
+
+14. **所有第三方 API 都用 `javap` 反编译核对过**。写这版时所在环境连不上
+    GitHub / Javadoc（Docker Hub API 也返回 `http=000`），所以下载了 jar 包，
+    用 `javap -cp <解压目录>` 逐个确认签名后再写代码 ——
+    `org.redisson.config.Config` / `SingleServerConfig` / `BaseConfig`
+    （`setRetryAttempts` / `setRetryInterval` / `setTimeout` / `setConnectTimeout`
+    在 **`BaseConfig`** 上，不在 `SingleServerConfig`）、`RLock`、
+    `RabbitTemplate` 的 `setMandatory` / `setConfirmCallback` / `setReturnsCallback`、
+    `ReturnedMessage`（在 `spring-amqp` 的 `org.springframework.amqp.core` 下，
+    不在 `spring-rabbit`）、`AmqpHeaders`（在 `org.springframework.amqp.support`）等等。
+    这样做避免了长时间「猜 → 编译失败 → 改」的循环。
+
+15. **`RabbitMQConfiguration` 里的 `Binding` 方法是注入 Bean 再绑的**，
+    不是在 `@Bean` 方法里直接 `new Queue(...)`。因为 4 个队列 / 2 个交换机
+    按类型注入会有歧义，必须配 `@Qualifier`；
+    而 `seckillDelayQueue(null)` 这种写法会在 `properties.getOrderDelayMillis()` 上直接 NPE。

@@ -129,3 +129,63 @@ VALUES (1, 'Xiaomi 15 Pro 手机', '2K 曲面屏，骁龙旗舰芯片', 4999.00,
         'https://cdn.example.com/product/mx-master-4.jpg', '数码'),
        (10, '小米智能手环 10', 'AMOLED 屏，14 天续航', 299.00, 300,
         'https://cdn.example.com/product/mi-band-10.jpg', '数码');
+
+-- ---------------------------------------------------------------- seckill_activity 秒杀活动（v3.0）
+CREATE TABLE IF NOT EXISTS `seckill_activity`
+(
+    `id`            BIGINT         NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `product_id`    BIGINT         NOT NULL COMMENT '秒杀商品 -> product.id',
+    `title`         VARCHAR(128)   NOT NULL COMMENT '活动标题',
+    `seckill_price` DECIMAL(10, 2) NOT NULL COMMENT '秒杀价',
+    -- 这一列是「数据库侧的权威剩余库存」。每条秒杀订单落库时都会用带条件的 UPDATE 扣它一次
+    -- （WHERE seckill_stock >= 1），所以它永远不会变成负数 —— 这是不超卖的最后一道防线。
+    -- Redis 里的 seckill:stock:{id} 是它的高频读取副本，预热时从这里初始化。
+    `seckill_stock` INT            NOT NULL DEFAULT 0 COMMENT '剩余秒杀库存（DB 侧权威值）',
+    `start_time`    DATETIME       NOT NULL COMMENT '开始时间',
+    `end_time`      DATETIME       NOT NULL COMMENT '结束时间',
+    `status`        TINYINT        NOT NULL DEFAULT 1 COMMENT '1=已发布 0=已下线',
+    `create_time`   DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `update_time`   DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (`id`),
+    KEY `idx_seckill_activity_status` (`status`),
+    -- 前台按「已发布 + 时间窗口」筛活动
+    KEY `idx_seckill_activity_window` (`start_time`, `end_time`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT = '秒杀活动';
+
+-- ---------------------------------------------------------------- seckill_order 秒杀订单（v3.0）
+-- 为什么和 orders 分表：秒杀订单是 MQ 异步落库的，字段和约束都不一样，
+-- 而且它需要一个普通订单没有的概念 —— 「一人一单」的唯一索引。
+-- 分表的代价是「我的订单」要查两张表，本版没做统一视图（见 version3.0 的取舍章节）。
+CREATE TABLE IF NOT EXISTS `seckill_order`
+(
+    `id`            BIGINT         NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `order_no`      VARCHAR(32)    NOT NULL COMMENT '订单号，SK 前缀',
+    `activity_id`   BIGINT         NOT NULL COMMENT '活动 -> seckill_activity.id',
+    `user_id`       BIGINT         NOT NULL COMMENT '下单用户 -> user.id',
+    `product_id`    BIGINT         NOT NULL COMMENT '商品 -> product.id',
+    `product_name`  VARCHAR(128)   NOT NULL COMMENT '商品名快照（商品改名/被删都不影响历史订单）',
+    `seckill_price` DECIMAL(10, 2) NOT NULL COMMENT '秒杀价快照',
+    `quantity`      INT            NOT NULL DEFAULT 1 COMMENT '数量，本版固定 1',
+    `status`        TINYINT        NOT NULL DEFAULT 0 COMMENT '0待支付 1已支付 2已取消 3已关闭',
+    `message`       VARCHAR(255)            DEFAULT NULL COMMENT '结果/关单原因说明',
+    `pay_time`      DATETIME                DEFAULT NULL COMMENT '支付时间',
+    `create_time`   DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '下单时间',
+    `update_time`   DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_seckill_order_no` (`order_no`),
+    -- ★ 「一人一单」的最终保证。
+    --   Redis 的 seckill:bought:{id} 集合是快速判断，可能因为 Redis 重启 / 被 FLUSH 而丢失；
+    --   这个唯一索引不会丢，任何并发下的重复插入都会被数据库拒绝。
+    --   注意：取消订单后不能重新抢购，正是因为这条记录还在（见 lua/seckill_refund.lua 的说明）。
+    UNIQUE KEY `uk_seckill_order_user` (`activity_id`, `user_id`),
+    KEY `idx_seckill_order_user` (`user_id`),
+    KEY `idx_seckill_order_status` (`status`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT = '秒杀订单';
+
+-- 演示秒杀活动。时间用 NOW() 现算，装上就能抢；应用启动时
+-- DataInitializer 会检查并（过期了就）把窗口往后顺延，保证演示随时可用。
+INSERT IGNORE INTO `seckill_activity`
+(`id`, `product_id`, `title`, `seckill_price`, `seckill_stock`, `start_time`, `end_time`, `status`)
+VALUES (1, 6, 'AirPods Pro 3 限时秒杀', 999.00, 50, NOW(), DATE_ADD(NOW(), INTERVAL 2 HOUR), 1);

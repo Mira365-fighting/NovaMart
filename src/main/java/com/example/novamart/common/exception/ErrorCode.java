@@ -23,6 +23,16 @@ public enum ErrorCode {
     ORDER_NOT_FOUND(40007, "订单不存在", HttpStatus.NOT_FOUND),
     ORDER_STATUS_ILLEGAL(40008, "当前订单状态不允许该操作", HttpStatus.CONFLICT),
 
+    // 秒杀类（v3.0）
+    SECKILL_NOT_FOUND(40009, "秒杀活动不存在", HttpStatus.NOT_FOUND),
+    SECKILL_NOT_STARTED(40010, "秒杀还没开始，请稍候", HttpStatus.CONFLICT),
+    SECKILL_ENDED(40011, "秒杀已结束", HttpStatus.CONFLICT),
+    SECKILL_SOLD_OUT(40012, "手慢了，商品已被抢光", HttpStatus.CONFLICT),
+    SECKILL_DUPLICATE(40013, "您已经抢到过了，每人限购 1 件", HttpStatus.CONFLICT),
+    SECKILL_ORDER_NOT_FOUND(40014, "秒杀订单不存在", HttpStatus.NOT_FOUND),
+    SECKILL_ORDER_STATUS_ILLEGAL(40015, "当前秒杀订单状态不允许该操作", HttpStatus.CONFLICT),
+    SECKILL_NOT_READY(40016, "秒杀活动正在准备中，请稍后重试", HttpStatus.CONFLICT),
+
     // 认证类
     UNAUTHORIZED(40101, "未登录或登录已过期", HttpStatus.UNAUTHORIZED),
     USER_DISABLED(40102, "账号已被禁用，请联系管理员", HttpStatus.UNAUTHORIZED),
@@ -36,7 +46,9 @@ public enum ErrorCode {
     CONFLICT(40901, "数据冲突", HttpStatus.CONFLICT),
 
     // 系统类
-    INTERNAL_ERROR(50001, "系统异常", HttpStatus.INTERNAL_SERVER_ERROR);
+    INTERNAL_ERROR(50001, "系统异常", HttpStatus.INTERNAL_SERVER_ERROR),
+    /** Redis / RabbitMQ 这类外部依赖不可用：不是业务错，重试可能就好 */
+    SERVICE_UNAVAILABLE(50301, "服务暂时不可用，请稍后重试", HttpStatus.SERVICE_UNAVAILABLE);
 
     private final int code;
     private final String message;
