@@ -1,0 +1,32 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: NovaMart
+  datasource:
+    url: ${DB_URL:jdbc:mysql://localhost:3306/novamart?useUnicode=true&characterEncoding=utf8&serverTimezone=GMT%2B8}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:123456}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  # 日期格式统一按东八区输出
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: GMT+8
+
+mybatis-plus:
+  configuration:
+    # product_name -> productName，实体属性与表字段自动对应，不用再写 resultMap
+    map-underscore-to-camel-case: true
+    # 开发期把执行的 SQL 打到控制台，方便排查；生产可去掉
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      # 主键统一用数据库自增，实体上就不用逐个写 @TableId(type = IdType.AUTO)
+      id-type: auto
+
+novamart:
+  jwt:
+    # 仅开发用缺省值；生产必须用环境变量注入 Base64 编码、长度 >= 256bit 的密钥
+    secret: ${JWT_SECRET:bm92YW1hcnQtZGV2ZWxvcG1lbnQta2V5LWNoYW5nZS1tZS0zMi1ieXRlcw==}
+    expiration: ${JWT_EXPIRATION_MS:86400000}

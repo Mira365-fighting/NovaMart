@@ -1,0 +1,150 @@
+# NovaMart v1.0 —— 初版记录
+
+> 项目起步版本：**Spring Boot 4.0.8 + Java 17 + MyBatis-Plus + MySQL + jjwt**，
+> 实现「注册 / 登录（JWT）/ 浏览商品 / 购物车」，纯 CRUD + JWT 鉴权。
+
+
+---
+
+## 一、需求
+
+1. **用户注册 / 登录**：登录后签发 JWT，有效期内凭 Token 访问系统，无需重复输入账号密码。
+2. **浏览商品**：分页列表（支持关键字）+ 详情，两个公开接口。
+3. **购物车**：查看列表 / 加入商品 / 修改数量 / 删除一行。
+4. 纯 CRUD + JWT；ORM 用 MyBatis（SQL 写在 XML 里）。
+5. 订单模块 = 从购物车下单（扣库存、清空购物车）+ 订单分页 + 订单详情 + 取消订单。
+6. 用 **MyBatis-Plus** 简化单表 CRUD，按本项目已有的版本体系引依赖。
+
+---
+
+## 二、依赖
+
+| 依赖 | 版本 | 用途 |
+| --- | --- | --- |
+| `spring-boot-starter-parent` | 4.0.8 | 版本管理（Spring Boot 4） |
+| `spring-boot-starter-webmvc` | 随 parent | REST API、内嵌 Tomcat、拦截器 |
+| `mybatis-spring-boot-starter` | 4.0.1 | MyBatis ORM，SQL 写在 `resources/mapper/*.xml` |
+| `mysql-connector-j` | 随 parent | JDBC 驱动 |
+| `spring-boot-starter-data-redis` | 随 parent | 购物车缓存 |
+| `java-jwt`| 签发 / 校验 JWT |
+| `spring-security-crypto` | 随 parent | BCrypt 密码加密|
+| `lombok` | 随 parent | `@Data` / `@Slf4j` 简化样板代码 |
+| `spring-boot-devtools` | 随 parent | 热部署 |
+
+---
+
+## 三、目录结构
+
+```
+common/exception   BusinessException / ErrorCode / GlobalExceptionHandler
+common/result      ApiResult
+config             MyBatisPlusConfiguration（分页插件）/ PasswordConfiguration / WebConfiguration
+controller         UserController / ProductController / CartController / OrderController
+dto                RegisterDTO / LoginDTO / CartItemDTO
+entity             User / Product / CartItem / Order / OrderItem
+interceptor        JwtAuthenticationInterceptor
+mapper             UserMapper / ProductMapper / CartMapper / OrderMapper / OrderItemMapper
+service            UserService / ProductService / CartService / OrderService / JwtService
+util               PageUtil
+vo                 ProductVO / CartVO / LoginVO / OrderVO / OrderItemVO / OrderDetailVO / PageResult
+```
+
+分层约定：`controller → service → mapper → entity`；`dto` 收前端数据、`vo` 发后端数据，实体不进出接口签名。
+
+---
+
+## 四、功能与接口清单
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/api/user/register` | 否 | 注册，返回 userId |
+| POST | `/api/user/login` | 否 | 登录，返回 JWT |
+| GET | `/api/product/page?pageNum=&pageSize=&keyword=` | 否 | 商品分页（PageHelper） |
+| GET | `/api/product/{id}` | 否 | 商品详情 |
+| GET | `/api/cart/list` | 是 | 购物车列表 |
+| POST | `/api/cart/add` | 是 | 加入购物车（已有则累加） |
+| PUT | `/api/cart/update` | 是 | 修改数量（覆盖） |
+| DELETE | `/api/cart/{productId}` | 是 | 删除一行 |
+| DELETE | `/api/cart` | 是 | 清空购物车 |
+| POST | `/api/order/submit` | 是 | 从购物车提交订单 |
+| GET | `/api/order/page?pageNum=&pageSize=` | 是 | 我的订单分页 |
+| GET | `/api/order/{id}` | 是 | 订单详情（含明细） |
+| PUT | `/api/order/{id}/cancel` | 是 | 取消订单（回滚库存） |
+
+鉴权方式：登录拿 token 后，其它请求带 `Authorization: Bearer <token>`。
+购物车 / 订单接口的 userId 一律从 Token 解析，前端传不了也伪造不了。
+
+---
+
+## 五、配置
+
+### 1. application.yml
+
+配置全部写成 `${环境变量:默认值}`，开发时用默认值省事，部署时用环境变量覆盖，不用改一行代码（12-Factor 的做法）。
+
+| 配置项 | 环境变量 | 说明 |
+| --- | --- | --- |
+| `server.port` | `SERVER_PORT` | 服务端口 |
+| `spring.datasource.url` / `username` / `password` | `DB_URL` / `DB_USERNAME` / `DB_PASSWORD` | MySQL 连接 |
+| `spring.data.redis.host` / `port` | — | Redis 连接 |
+| `mybatis.configuration.map-underscore-to-camel-case` | — | 下划线列名 → 驼峰属性，省得写 `<resultMap>` |
+| `jwt.secret` / `jwt.expiration` | `JWT_SECRET` / `JWT_EXPIRATION_MS` | 签名密钥与有效期 |
+
+已知问题：`spring.jackson` 那几个配置项被误写在 `spring.datasource` 下面（等于没生效），v2.0 才挪到正确层级。
+
+### 2. 配置类
+
+- **`PasswordConfiguration`**：声明 `BCryptPasswordEncoder` Bean。
+- **`WebConfiguration`**：用 `WebMvcConfigurer.addInterceptors` 注册 JWT 拦截器，**只拦 `/api/cart/**`**（商品、注册、登录都是公开接口）。
+  用 Interceptor 而不是 Filter，是因为它直接由 Spring 管理、能注入 Bean，也能拿到 Controller 的元数据。
+- **MyBatis-Plus 配置
+
+## 六、关键实现
+
+### 1. 统一响应与异常体系
+
+- `ApiResult<T>`（record）：`code` / `message` / `data` 三段式，保证前后端交互格式一致。
+- `BusinessException extends RuntimeException`，内部持有 `ErrorCode`：业务异常不需要强制捕获，抛出去一路交给全局处理器；
+  错误码是结构化枚举，不是散落各处的魔法字符串。两个构造器 —— 一个用错误码默认文案，一个允许调用方传更具体的提示。
+- `ErrorCode` 枚举里**带了一个 `HttpStatus` 字段**。
+  （浏览器、网关、监控系统都识别不了），于是让 HTTP 状态码只表达传输层结果（200/400/401/409/500），
+  业务码放在响应体里由前端判断。既合规范，又保留了业务区分能力。
+- `GlobalExceptionHandler`（`@RestControllerAdvice`）分四层兜底：
+  业务异常优先匹配 → 参数校验异常（`@Valid` 失败、JSON 解析失败）取第一条错误信息返回 400 →
+  数据库唯一键冲突返回 409 → `Exception.class` 兜底返回 500 且不把堆栈暴露给前端。
+- 效果：Controller 层没有任何 try-catch，业务代码只要 `throw new BusinessException(ErrorCode.XXX)` 就能返回结构化的错误信息。
+
+### 2. 注册 / 登录
+
+- **注册**：`RegisterDTO(username, password, phone)` → BCrypt 加密后入库；
+  应用层先做唯一性预检以给出友好提示，数据库唯一索引做最终兜底。
+- **登录**：`LoginDTO(username, password)` → 用 BCrypt 比对哈希，凭证错误统一返回「用户名或密码错误」（防止用户名探测攻击）；
+  校验通过后签发 JWT 返回前端。
+- 全流程事务保护、异常统一处理、明文密码不落库。
+
+### 3. 商品模块（手写分页）
+
+两个公开接口：分页列表 + 详情。Controller 很薄，只做参数接收和结果包装，业务逻辑全在 Service。
+分页参数给了默认值防止前端漏传，`keyword` 非必填以支持全量浏览。
+
+**分页是手写的**：Mapper 里写 `countByKeyword` + `selectPage(keyword, offset, limit)` 两条 SQL，
+Service 里手工算 offset，再用 `PageResult` 包一层。
+优点是简单直接、SQL 完全可控；缺点是样板代码多（v2.0 换成了 PageHelper）。
+
+### 4. 购物车 + Redis（Cache-Aside）
+
+- 数据结构：Redis **Hash**，key 是 `cart:{userId}`，field 是 `productId`，value 是 `CartVO` 的 JSON。
+- **读**：先查 Redis，miss 就回源 MySQL 并把结果回填 Redis。
+- **写**（加 / 改 / 删）：先落 MySQL，成功后删缓存；写完直接返回完整购物车，前端直接渲染，省掉一次请求。
+- **降级**：所有缓存操作都捕获 `DataAccessException`，Redis 不可用时直接走 MySQL，保证接口可用性。
+- TTL 30 分钟，每次写操作后重置。
+- 接口全部经过 JWT 拦截器保护，userId 从 Token 解析后写入 request attribute，Controller 用 `@RequestAttribute` 取。
+
+### 5. 拦截器
+
+从请求头提取 `Authorization: Bearer <token>`，校验签名和过期时间，通过后把 userId 写进 request attribute 供 Controller 使用。
+校验失败时**在拦截器里手写 401 JSON 返回**（所以拦截器要注入 `ObjectMapper`，`preHandle` 还要 `throws IOException`）。
+这一点 v2.0 简化掉了。
+
+
+
