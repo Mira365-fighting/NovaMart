@@ -5,7 +5,7 @@ import org.springframework.http.HttpStatus;
 /**
  * 业务错误码。
  *
- * <p>每个错误码带上对应的 HTTP 状态码：HTTP 状态码只表达传输层结果（200/400/401/404/409/500），
+ * <p>每个错误码带上对应的 HTTP 状态码：HTTP 状态码只表达传输层结果（200/400/401/403/404/409/500），
  * 业务区分交给 code，这样网关、监控、浏览器都能正确识别，前端也能精确判断。
  */
 public enum ErrorCode {
@@ -21,9 +21,16 @@ public enum ErrorCode {
     PRODUCT_NOT_FOUND(40005, "商品不存在或已下架", HttpStatus.NOT_FOUND),
     CART_NOT_FOUND(40006, "购物车中不存在该商品", HttpStatus.NOT_FOUND),
     ORDER_NOT_FOUND(40007, "订单不存在", HttpStatus.NOT_FOUND),
+    ORDER_STATUS_ILLEGAL(40008, "当前订单状态不允许该操作", HttpStatus.CONFLICT),
 
     // 认证类
     UNAUTHORIZED(40101, "未登录或登录已过期", HttpStatus.UNAUTHORIZED),
+    USER_DISABLED(40102, "账号已被禁用，请联系管理员", HttpStatus.UNAUTHORIZED),
+    REFRESH_TOKEN_INVALID(40103, "登录状态已失效，请重新登录", HttpStatus.UNAUTHORIZED),
+    TOKEN_REVOKED(40104, "登录状态已失效，请重新登录", HttpStatus.UNAUTHORIZED),
+
+    // 授权类
+    FORBIDDEN(40301, "无权限访问", HttpStatus.FORBIDDEN),
 
     // 冲突类
     CONFLICT(40901, "数据冲突", HttpStatus.CONFLICT),

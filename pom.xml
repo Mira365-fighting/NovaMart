@@ -27,6 +27,23 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc</artifactId>
         </dependency>
+        <!--
+            Spring Security：本版用它做「前后台权限分离」——
+            JwtAuthenticationFilter 负责认证，@PreAuthorize("hasRole('ADMIN')") 负责鉴权。-->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+        <!--
+            Redis：本版重新引入，干两件事——
+            1) 退出登录把 Token 的 jti 写进黑名单（TTL = Token 剩余有效期，到期自动清理）；
+            2) 商品详情缓存（含空值缓存 + 随机 TTL）。
+            所有 Redis 调用点都做了降级：Redis 挂了应用照常可用，只是没有缓存和吊销能力。-->
+        <!-- redis -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
         <!--参数校验 DTO上的 @NotNull @NotBlank @Pattern @Size-->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -68,13 +85,13 @@
             <artifactId>lombok</artifactId>
             <optional>true</optional>
         </dependency>
-        <!--JWT：登录成功后签发 Token，一段时间内不用再输账号密码-->
+        <!--JWT：登录签发 accessToken(2h) + refreshToken(7d)；退出时按 jti 拉黑-->
         <dependency>
             <groupId>com.auth0</groupId>
             <artifactId>java-jwt</artifactId>
             <version>${java-jwt.version}</version>
         </dependency>
-        <!--BCrypt 密码加密与校验（只用到 crypto，不引 Spring Security 全家桶）-->
+        <!--BCrypt 密码加密与校验（starter 已带，显式声明表明它是主动使用的依赖）-->
         <dependency>
             <groupId>org.springframework.security</groupId>
             <artifactId>spring-security-crypto</artifactId>
@@ -83,6 +100,11 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>

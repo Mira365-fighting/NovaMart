@@ -9,6 +9,19 @@ spring:
     username: ${DB_USERNAME:root}
     password: ${DB_PASSWORD:123456}
     driver-class-name: com.mysql.cj.jdbc.Driver
+  # Redis：Token 黑名单 + 商品详情缓存。连接失败不影响启动，运行期各调用点自带降级。
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:123456}
+      database: ${REDIS_DATABASE:0}
+      timeout: 2s
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 0
   # 日期格式统一按东八区输出
   jackson:
     date-format: yyyy-MM-dd HH:mm:ss
@@ -29,4 +42,17 @@ novamart:
   jwt:
     # 仅开发用缺省值；生产必须用环境变量注入 Base64 编码、长度 >= 256bit 的密钥
     secret: ${JWT_SECRET:bm92YW1hcnQtZGV2ZWxvcG1lbnQta2V5LWNoYW5nZS1tZS0zMi1ieXRlcw==}
-    expiration: ${JWT_EXPIRATION_MS:86400000}
+    # accessToken 2 小时；用户拿它在有效期内免登录
+    access-expiration: ${JWT_ACCESS_EXPIRATION_MS:7200000}
+    # refreshToken 7 天；accessToken 过期后用它换一对新 Token，避免频繁弹登录
+    refresh-expiration: ${JWT_REFRESH_EXPIRATION_MS:604800000}
+  cache:
+    # 商品详情缓存基础 TTL：30 分钟
+    product-ttl-seconds: ${PRODUCT_CACHE_TTL_SECONDS:1800}
+    # 在基础 TTL 上再叠加 0~10 分钟随机量，避免同一时刻大批 key 一起过期造成缓存雪崩
+    product-ttl-random-seconds: ${PRODUCT_CACHE_RANDOM_SECONDS:600}
+    # 空值缓存 5 分钟：查不到的商品也缓存起来，挡住缓存穿透
+    product-null-ttl-seconds: ${PRODUCT_CACHE_NULL_TTL_SECONDS:300}
+  cors:
+    # 前端 dev server（Vite 5173）；生产由后端直接托管静态页，属同源
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}

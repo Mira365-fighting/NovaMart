@@ -1,0 +1,487 @@
+# NovaMart v2.0 —— 前后台分离 + 完整登录态 + Vue3 前端
+
+> 本版在 v1.0（注册 / 登录 / 商品 / 购物车 / 订单的纯 CRUD）之上做了四件大事：
+> **完整登录态**（黑名单退出 + 双 Token + ThreadLocal）、**商品缓存**（Redis 回归）、
+> **前后台分离**（用户端 / 管理端 + 角色鉴权）、**并发安全的下单**（事务 + 行锁），
+> 并新增 **Vue3 + Element Plus 响应式前端**。
+
+---
+
+## 一、需求
+
+1. **登录态做完整**
+   - 退出登录时把 Token 写入 Redis 黑名单，过滤器逐个请求校验；
+   - Refresh Token 机制：短 Token 2 小时 + 长 Token 7 天，短 Token 过期靠长 Token 无感续期；
+   - 拦截器统一解析，userId 放进 ThreadLocal，业务层直接取。
+2. **商品模块 + Redis 缓存**
+   - 商品详情缓存 `product:{id}`，miss 则查库再 SET（基础 TTL 30 分钟）；
+   - 查不到的商品也缓存 NULL，TTL 5 分钟 —— 防缓存穿透；
+   - 基础 TTL 上叠加 0~10 分钟随机量 —— 防缓存雪崩；
+   - 商品列表加分页。
+3. **前后台分离**
+   - 前台：商品搜索（按名称模糊）、分类筛选、订单状态流转（取消 / 确认收货）；
+   - 后台（Admin）：商品 CRUD、订单管理（发货 / 关闭）、用户管理；
+   - 用 `@PreAuthorize("hasRole('ADMIN')")` 区分前后台权限；
+   - 所有列表接口统一分页参数。
+4. **购物车 / 订单优化**
+   - 购物车合并：登录后把 localStorage 里的临时购物车合并进 DB；
+   - 订单创建纳入事务（`@Transactional`，创建订单 + 扣库存原子化）；
+   - 库存扣减改用数据库行锁 `SELECT ... FOR UPDATE`。
+5. 把本版引入的依赖和配置文件结构写进本文档。
+6. 加入 **Vue3 + Element Plus** 构建响应式页面。
+
+---
+
+## 二、本版新引入的依赖
+
+### 后端（pom.xml）
+
+| 依赖 | 版本 | 用途 |
+| --- | --- | --- |
+| `spring-boot-starter-security` | 随 parent（Spring Security **7.0.7**） | 认证过滤器链 + `@PreAuthorize` 方法级鉴权；顺带提供 BCrypt |
+| `spring-boot-starter-data-redis` | 随 parent | **Redis 回归**：Token 黑名单 + 商品详情缓存 |
+| `spring-security-test` | 随 parent（test） | 安全相关的测试支持 |
+
+已有的依赖保持不变：`spring-boot-starter-webmvc`、`spring-boot-starter-validation`、
+`mybatis-plus-spring-boot4-starter` 3.5.17、`pagehelper` 6.1.0（核心包）、
+`com.auth0:java-jwt` 4.4.0、`lombok`、`mysql-connector-j`、`spring-boot-devtools`。
+
+### 前端（frontend/package.json）
+
+| 依赖 | 版本 | 用途 |
+| --- | --- | --- |
+| `vue` | 3.5.44 | 全部用 `<script setup>` 组合式 API |
+| `vue-router` | 4.6.4 | 路由 + 角色守卫（hash 模式） |
+| `pinia` | 2.3.1 | 登录态、购物车状态管理 |
+| `element-plus` | 2.14.7 | UI 组件库 |
+| `@element-plus/icons-vue` | 2.3.2 | 图标 |
+| `axios` | 1.20.0 | HTTP 客户端 + 拦截器 |
+| `vite` | 5.4.21 | 构建 / dev server |
+| `@vitejs/plugin-vue` | 5.2.4 | Vue SFC 编译 |
+
+---
+
+## 三、配置文件结构
+
+### 1. `src/main/resources/application.yml`
+
+```yaml
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: NovaMart
+  datasource:                       # MySQL 连接
+    url / username / password / driver-class-name
+  data:
+    redis:                          # 本版新增：Token 黑名单 + 商品缓存
+      host / port / database / timeout
+      lettuce.pool: max-active / max-idle / min-idle
+  jackson:                          # 日期统一按东八区输出
+    date-format / time-zone
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true   # product_name -> productName
+    log-impl: StdOutImpl                 # 开发期打印 SQL
+  global-config:
+    db-config:
+      id-type: auto                      # 主键自增，实体不写 @TableId
+
+novamart:
+  jwt:
+    secret                              # Base64 且 >= 256bit
+    access-expiration                   # 短 Token，默认 7200000ms = 2h
+    refresh-expiration                  # 长 Token，默认 604800000ms = 7d
+  cache:
+    product-ttl-seconds: 1800           # 商品详情基础 TTL 30 分钟
+    product-ttl-random-seconds: 600     # 叠加 0~600s 随机量（防雪崩）
+    product-null-ttl-seconds: 300       # 空值缓存 5 分钟（防穿透）
+  cors:
+    allowed-origins                     # 前端 dev server，逗号分隔
+```
+
+全部走 `${环境变量:默认值}`，部署时用环境变量覆盖，不改代码：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SERVER_PORT` | 8080 | 服务端口 |
+| `DB_URL` / `DB_USERNAME` / `DB_PASSWORD` | 本机 novamart | MySQL 连接 |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_DATABASE` | localhost / 6379 / 0 | Redis 连接 |
+| `JWT_SECRET` | 开发用缺省值 | 签名密钥（Base64、≥256bit） |
+| `JWT_ACCESS_EXPIRATION_MS` | 7200000 | 短 Token 有效期 |
+| `JWT_REFRESH_EXPIRATION_MS` | 604800000 | 长 Token 有效期 |
+| `PRODUCT_CACHE_TTL_SECONDS` / `..._RANDOM_SECONDS` / `..._NULL_TTL_SECONDS` | 1800 / 600 / 300 | 缓存 TTL |
+| `CORS_ALLOWED_ORIGINS` | localhost:5173 | 允许跨域的来源 |
+
+### 2. 数据库脚本（`src/main/resources/db/`）
+
+| 文件 | 用途 |
+| --- | --- |
+| `schema.sql` | **全新安装**：建库 + 五张表 + 10 条商品种子数据 |
+| `upgrade.sql` | **老库升级**：给 `user` 加 `role`/`status`；给 `orders` 加 `pay_time`/`ship_time`/`finish_time` 并把旧的「已取消=2」改写成「已取消=4」；补索引和新增商品 |
+
+表结构变化：
+- `user`：新增 `role`（`USER`/`ADMIN`）、`status`（1 正常 / 0 禁用）；
+- `orders`：`status` 语义扩展为 **0 待支付 / 1 已支付 / 2 已发货 / 3 已完成 / 4 已取消 / 5 已关闭**，
+  并新增 `pay_time`、`ship_time`、`finish_time`；
+- `product`：新增 `status` 索引；
+- 演示账号由 `config/DataInitializer` 在启动时创建（密码要 BCrypt，没法写死在 SQL 里）：
+  **`admin / admin123`（ADMIN）**、**`user01 / user1234`（USER）**。
+
+### 3. 前端 `frontend/vite.config.js`
+
+```js
+//server.proxy:  '/api' -> 'http://localhost:8080'      // dev 时跨域代理
+//build.outDir:  '../src/main/resources/static'          // 打包产物直接进后端静态目录
+//build.emptyOutDir: true
+```
+
+生产环境由 Spring Boot 直接托管打包后的 SPA（同源，不需要 CORS）；
+路由用 hash 模式，避免为深链接做服务端 fallback。
+
+---
+
+## 四、目录结构
+
+### 后端（相比 v1.0 新增的部分）
+
+```
+security/          JwtAuthenticationFilter     认证过滤器（校验签名/过期/黑名单）
+                   RestSecurityHandlers         401 / 403 的 JSON 出口
+                   SecurityResponseWriter       统一错误响应体
+                   JwtPayload / UserContext     解析结果 / ThreadLocal 容器
+config/            SecurityConfiguration        过滤器链 + @EnableMethodSecurity
+                   WebConfiguration             拦截器注册 + CorsConfigurationSource
+                   DataInitializer              启动时创建演示账号
+interceptor/       UserContextInterceptor       把当前用户放进 ThreadLocal（请求结束清理）
+service/           TokenBlacklistService        Redis Token 黑名单
+                   ProductCacheService          商品详情缓存（命中/空值/随机 TTL）
+                   AdminProductService          后台商品 CRUD
+                   AdminOrderService            后台订单查询 + 发货/关闭
+                   AdminUserService             后台用户管理
+                   AdminStatisticsService       仪表盘统计
+controller/        AdminProductController / AdminOrderController / AdminUserController
+dto/               ProductDTO / RefreshTokenDTO / LogoutDTO / CartMergeDTO
+vo/                MeVO / UserVO / StatisticsVO
+```
+
+被删掉的：`interceptor/JwtAuthenticationInterceptor`（认证职责移交给 Security 过滤器）。
+
+### 前端（`frontend/`）
+
+```
+vite.config.js  index.html  package.json
+src/
+  api/        index.js(axios 实例+拦截器) user.js product.js cart.js order.js admin.js
+  stores/     auth.js(登录态) cart.js(购物车双模式)
+  router/     index.js(hash 模式 + requiresAuth / requiresAdmin 守卫)
+  layouts/    UserLayout.vue  AdminLayout.vue
+  components/ ProductCard.vue
+  utils/      auth.js  cartStorage.js  format.js
+  views/      HomeView  ProductDetailView  CartView  OrdersView  OrderDetailView
+              LoginView  RegisterView
+  views/admin/ DashboardView  ProductManageView  OrderManageView  UserManageView
+  styles/     global.css
+```
+
+---
+
+## 五、关键实现
+
+### 1. 完整登录态
+
+**双 Token**：一次登录签发两个 Token，靠 `typ` 声明区分，两个校验器各自绑定 `typ`，
+所以拿 refreshToken 当 accessToken 用会直接校验失败。
+
+| Token | 有效期 | 作用 |
+| --- | --- | --- |
+| accessToken | 2h | 每个请求放在 `Authorization: Bearer <...>` |
+| refreshToken | 7d | 只在 accessToken 过期后换新的一对 |
+
+`POST /api/user/refresh` 换 Token 时做**轮换**：旧的 refreshToken 用完立刻拉黑。
+这样长 Token 被窃取后重复使用会失败，风险窗口从 7 天缩小到「一次使用」。
+
+**Redis 黑名单**：JWT 是无状态的，签发出去收不回来，所以退出登录只能在服务端记一笔。
+
+- key 用 **jti**（Token 唯一标识）而不是整串 Token，`jwt:blacklist:{jti}`；
+- **TTL = Token 的剩余有效期** —— 过期后 key 自动消失，黑名单不会无限膨胀；
+- Redis 故障时降级：写不进去只记 warn（登出仍然成功），查不到一律当「未拉黑」，
+  宁可放过也不误伤正常请求。
+
+**过滤器 vs 拦截器的分工**（这是本版最值得说的一处设计）：
+
+```
+请求 → JwtAuthenticationFilter（Servlet 过滤器，Security 链里）
+         ├─ 校验签名 / 过期时间
+         ├─ 查 Redis 黑名单：已登出的 Token 即使签名有效也不认
+         ├─ 查用户：账号不存在或已禁用 → 不认证
+         └─ 认证成功 → 写入 SecurityContext（principal = userId，权限 = ROLE_ADMIN/ROLE_USER）
+       → UserContextInterceptor（MVC 拦截器）
+         ├─ 从 SecurityContext 取 userId + 角色，放进 UserContext（ThreadLocal）
+         └─ afterCompletion 里 clear()（Tomcat 线程会复用，不清会串号）
+       → Controller / Service：UserContext.requireUserId() 直接拿
+```
+
+**过滤器里校验失败不抛异常，只是不写 SecurityContext**。
+公开接口带着过期 Token 访问照样能过；需要登录的接口由 Spring Security 统一回 401。
+「认证失败」的判断因此只在一个地方，不用每个接口自己判。
+
+另外，过滤器**每次都查一次数据库拿最新角色和状态**，换来的是：
+后台改了角色 / 禁用了账号，**下一个请求立刻生效**，不用等 Token 过期。
+代价是每个带 Token 的请求多一次主键查询 —— 这个项目里可以接受。
+
+### 2. 商品缓存（穿透 / 雪崩 / 一致性）
+
+```java
+// 读
+Optional<ProductVO> get(id)
+   ├─ 命中真实值             → 直接返回
+   ├─ 命中空值缓存(__NULL__) → 抛 PRODUCT_NOT_FOUND（把穿透挡在缓存层）
+   └─ miss                   → 回源数据库，然后写缓存（查不到就写空值缓存）
+```
+
+- **防穿透**：查不到的商品也缓存一个 `__NULL__` 占位，TTL 5 分钟。
+  否则有人拿随机 id 一直刷，请求会全部落到数据库。
+- **防雪崩**：真实数据的 TTL = 基础 1800s + `ThreadLocalRandom` 的 0~600s 随机量，
+  不会出现「同一时刻大批 key 一起过期、请求同时回源」。
+- **一致性**：后台改 / 删商品后直接 `evict(id)` 删 key（**不是更新缓存**）。
+  并发下更新缓存容易写进旧值，删掉让下次读自然回源最稳。
+- 用 `StringRedisTemplate` + 手动 JSON 序列化，值就是一段可读的 JSON 字符串，
+  不引自定义 `RedisTemplate`，也避开 JDK 序列化的兼容问题。
+- 所有 Redis 调用点都 try-catch 降级：**Redis 挂了接口照常可用**，只是没有缓存。
+
+商品**列表不走缓存**：条件组合多、命中率低，缓存它性价比不高。
+
+### 3. 前后台分离
+
+**路径规划**（三类权限，写在 `SecurityConfiguration` 的 `authorizeHttpRequests` 里）：
+
+| 范围 | 规则 |
+| --- | --- |
+| `/api/user/register`、`/login`、`/refresh` | `permitAll()` |
+| `GET /api/product/**` | `permitAll()`（商品浏览公开） |
+| `/api/admin/**` | `hasRole("ADMIN")` |
+| 其它 `/api/**` | `authenticated()` |
+| 非 `/api/**`（前端静态资源） | `permitAll()` |
+
+**两层鉴权**：路径级规则挡住请求，`AdminXxxController` 类上的
+`@PreAuthorize("hasRole('ADMIN')")` 由 `@EnableMethodSecurity` 在方法入口再拦一道。
+两层配合的意义是：**就算以后路径规则漏配了，管理接口也进不来**。
+
+`hasRole('ADMIN')` 要的其实是 `ROLE_ADMIN`，所以过滤器把角色转成权限名时才拼上 `ROLE_` 前缀。
+
+**分页统一契约**：所有列表接口一律 `pageNum` / `pageSize`，由 `PageUtil.start()` + PageHelper 实现，
+返回值统一 `PageResult{pageNum,pageSize,total,pages,list}`。
+`reasonable=true` 让越界页码自动纠正到首/末页，而不是返回空列表。
+
+**403 必须显式处理**：`AccessDeniedException` 是 RuntimeException，
+`GlobalExceptionHandler` 里不单独写一条的话，会被最后的 `Exception.class` 兜底吞成 500。
+
+### 4. 购物车合并
+
+用户没登录时购物车存在浏览器 `localStorage`，登录那一刻一起提交上来：
+
+- 登录接口接受可选的 `cartItems`，在**同一个事务**里合并；
+- 另有 `POST /api/cart/merge` 兜底（已登录但本地还残留旧购物车的场景）；
+- 合并规则：同商品**数量相加**，统一受库存上限约束；
+- 两条容错原则（本地那份可能存了好几天，不能因为一行脏数据让登录失败）：
+  商品已删除 / 已下架 / 无库存 → **跳过这一行**；累加超过库存 → **取库存上限**。
+
+### 5. 订单：事务 + 行锁 + 带条件的 UPDATE
+
+**下单**（`OrderService.submit`，一个 `@Transactional` 里五步）：
+
+```
+1. 按商品 id 升序 SELECT ... FOR UPDATE 加行锁
+2. 持锁逐个判断库存 → 扣减（stock = stock - n，SQL 里再带 stock >= n 兜底）
+3. 写订单主表（状态 0 待支付）
+4. 写订单明细（商品名/单价快照）
+5. 清空购物车
+```
+
+- 行锁的作用：并发下单时第二个事务会卡在 `SELECT ... FOR UPDATE` 上等锁，
+  等它拿到锁时读到的已经是扣减后的库存，**不会超卖**。
+- `ORDER BY id` 很关键：并发事务按同样顺序申请行锁，不会出现循环等待（死锁）。
+- 之前只用 `UPDATE ... WHERE stock >= n` 判断+扣减，**没有锁**；
+  现在两者都有 —— 行锁保证「先判断后扣减」这段逻辑不被并发穿插，SQL 里的条件再兜一道底。
+
+**状态流转**统一走「带条件的 UPDATE」：
+
+```sql
+UPDATE orders SET status = ? WHERE id = ? AND status = ?
+```
+
+影响行数为 0 就说明状态已被别的请求改掉（并发点两次取消、重复发货），直接报 409。
+这样不用「先 SELECT 判断再 UPDATE」，天然避免并发下的重复流转。
+
+状态机（4 和 5 的区别只是谁发起的，业务上都把库存加回去）：
+
+```
+0 待支付 --支付(用户)--> 1 已支付 --发货(后台)--> 2 已发货 --确认收货(用户)--> 3 已完成
+0/1 --取消(用户)--> 4 已取消（回滚库存）
+0/1 --关闭(后台)--> 5 已关闭（回滚库存）
+```
+
+「状态怎么变」只在 `OrderService` 一处实现；「能查到谁的订单」才分前后台
+（前台校验归属，越权查别人的订单返回 404；后台不分用户）。
+
+### 6. Vue3 + Element Plus 前端
+
+- **一套 SPA + 两套布局**：`UserLayout`（顶部导航 + 搜索 + 购物车角标）和
+  `AdminLayout`（左侧 `el-menu` 侧边栏 + 面包屑），路由 `/admin/**` 需要 `role === 'ADMIN'`；
+- **axios 拦截器**：自动带 `Authorization`；响应统一解包 `{code,message,data}`；
+  遇到 **401** 自动用 refreshToken 换新 Token 并**重放原请求**（带 `_retried` 标志 + 共享的刷新 Promise，
+  不会无限重试也不会并发刷新多次）；刷新失败则清登录态跳登录页；403 提示「无权限访问」；
+- **购物车双模式**：未登录存 localStorage，登录后全部走后端接口，登录时自动合并；
+- **响应式**：`el-row/el-col` 响应式栅格，宽屏多列、窄屏自动堆叠；
+- **订单操作按状态显示**：待支付 → 支付/取消；已发货 → 确认收货；其它状态无操作按钮；
+  状态文案优先用后端返回的 `statusText`，本地映射只做兜底。
+
+---
+
+## 六、接口清单
+
+### 认证 `/api/user`
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/api/user/register` | 否 | 注册，返回 userId |
+| POST | `/api/user/login` | 否 | 登录；请求体可带 `cartItems` 一起合并购物车；返回 accessToken + refreshToken |
+| POST | `/api/user/refresh` | 否 | 用 refreshToken 换一对新 Token（旧 refreshToken 被轮换拉黑） |
+| POST | `/api/user/logout` | 是 | 退出登录，把 Token 写进 Redis 黑名单（可带 refreshToken 一起拉黑） |
+| GET | `/api/user/me` | 是 | 当前登录用户信息 |
+
+### 前台商品 `/api/product`（公开）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/product/page?pageNum=&pageSize=&keyword=&category=` | 商品分页，关键字按名称模糊 + 分类筛选 |
+| GET | `/api/product/categories` | 分类列表（给筛选下拉用） |
+| GET | `/api/product/{id}` | 商品详情（走 Redis 缓存） |
+
+### 购物车 `/api/cart`（需登录）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/cart/list` | 购物车列表 |
+| POST | `/api/cart/add` | 加入购物车（已有则累加） |
+| PUT | `/api/cart/update` | 修改数量（覆盖） |
+| DELETE | `/api/cart/{productId}` | 删除一行 |
+| DELETE | `/api/cart` | 清空购物车 |
+| POST | `/api/cart/merge` | 合并本地临时购物车 |
+
+### 前台订单 `/api/order`（需登录）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/order/submit` | 从购物车下单（事务 + 行锁） |
+| GET | `/api/order/page?pageNum=&pageSize=&status=` | 我的订单分页（可按状态筛） |
+| GET | `/api/order/{id}` | 订单详情（含明细，校验归属） |
+| PUT | `/api/order/{id}/pay` | 支付（模拟）：0 → 1 |
+| PUT | `/api/order/{id}/cancel` | 取消：0 → 4，回滚库存 |
+| PUT | `/api/order/{id}/confirm` | 确认收货：2 → 3 |
+
+### 后台管理 `/api/admin/**`（需 `ROLE_ADMIN`）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/admin/statistics` | 仪表盘统计（用户数 / 商品数 / 订单数 / 今日订单 / 累计销售额） |
+| GET | `/api/admin/product/page?pageNum=&pageSize=&keyword=&category=&status=` | 商品分页（含已下架） |
+| GET | `/api/admin/product/{id}` | 商品详情 |
+| POST | `/api/admin/product` | 新增商品 |
+| PUT | `/api/admin/product/{id}` | 修改商品（改完删缓存） |
+| DELETE | `/api/admin/product/{id}` | 删除商品（删缓存） |
+| GET | `/api/admin/order/page?pageNum=&pageSize=&keyword=&status=` | 全站订单分页 |
+| GET | `/api/admin/order/{id}` | 订单详情（任意用户） |
+| PUT | `/api/admin/order/{id}/ship` | 发货：1 → 2 |
+| PUT | `/api/admin/order/{id}/close` | 关闭：0/1 → 5，回滚库存 |
+| GET | `/api/admin/user/page?pageNum=&pageSize=&keyword=` | 用户分页（用户名 / 手机号模糊） |
+| PUT | `/api/admin/user/{id}/status?status=0` | 启用(1) / 禁用(0) |
+| PUT | `/api/admin/user/{id}/role?role=ADMIN` | 调整角色 |
+
+统一响应体 `{code, message, data}`，`code = 0` 为成功。
+未登录 401（`40101`）、无权限 403（`40301`）、参数错 400、越权访问别人的订单 404、状态冲突 409。
+
+---
+
+## 七、跑起来
+
+```bash
+# 1) 数据库
+mysql --default-character-set=utf8mb4 -uroot -p < src/main/resources/db/schema.sql   # 全新安装
+mysql --default-character-set=utf8mb4 -uroot -p < src/main/resources/db/upgrade.sql  # 老库升级（只跑一次）
+
+# 2) Redis（黑名单 + 商品缓存需要）
+redis-server
+
+# 3) 后端
+mvn spring-boot:run
+# 或
+mvn -DskipTests package && java -jar target/NovaMart-0.0.1-SNAPSHOT.jar
+
+# 4) 前端
+cd frontend
+npm install
+npm run dev      # 开发：http://localhost:5173，/api 代理到 8080
+npm run build    # 打包：产物输出到 src/main/resources/static，由后端直接托管
+```
+
+> ⚠️ 注意：当前 `pom.xml` **没有 `<build>` 段**，所以 `mvn spring-boot:run` 和
+> `java -jar` 都用不了（打出来的 jar 没有主清单属性）。本版验证时是用
+> `java -cp "target/classes;<mvn dependency:build-classpath 的输出>" com.example.novamart.NovaMartApplication`
+> 启动的。要恢复可执行 jar，把 `spring-boot-maven-plugin` 加回 `<build><plugins>` 即可。
+
+Redis 挂了也能启动和访问，只是没有缓存和 Token 吊销能力（各调用点都有降级）。
+
+---
+
+## 八、实测结果
+
+启动了真实的 Spring Boot 应用（MySQL 8.0 + Redis 8.10.2，用 18090 端口避开占用），
+用脚本跑完整链路，**87 项全部通过、0 失败**。脚本留档在 `illustration/version2.0-e2e.sh`。
+
+| 分组 | 关键验证 |
+| --- | --- |
+| 商品 | total=10 / pages=3；名称模糊搜「耳机」命中 2；分类「手机」命中 3；`pageNum=999` 被纠正到第 3 页 |
+| 缓存 | `product:1` 写入成功、TTL=2175s（落在 1800~2400 区间内，随机量生效）；不存在的 id 两次都 404，且 Redis 里是 `__NULL__`、TTL=299s |
+| 双 Token | `expiresIn=7200`；refresh 换新 Token 后**旧 refreshToken 立刻 401**（轮换生效）；拿 refreshToken 当 accessToken 用 401 |
+| 黑名单 | 登出后 accessToken 和 refreshToken **都立即 401**；Redis 里出现 3 个 `jwt:blacklist:*` |
+| 购物车 | 登录带 `cartItems` 自动合并；`merge` 会跳过不存在的商品、同商品 2+3=5；超库存拦截 400 |
+| 订单流转 | 下单→0；支付→1；重复支付 409；发货→2；已发货不能取消 409；确认收货→3；重复确认 409 |
+| 事务 / 行锁 | 下单扣减库存正确；取消后库存回滚到原值；**把库存置 1 后两个用户并发下单，只成功 1 个、库存停在 0，没有超卖** |
+| 越权 | 看别人订单 404；普通用户访问 `/api/admin/**` 403；无 Token 401 |
+| 后台 | 商品分页 / 新增 / 改 / 删全通；**改完商品缓存被删除、详情读到新价格**；删除后详情 404 且缓存里是空值占位；订单详情可看任意用户；统计返回 `{userCount:5, productCount:10, orderCount:4, todayOrderCount:4, totalSales:1899.0}` |
+| 用户管理 | 禁用后该用户**已有 Token 下一个请求就 401**、也无法再登录；恢复后可登录；管理员不能禁用自己 / 改自己角色（400）；提权后立刻能进后台、降权后立刻 403 |
+| 前端 | 后端托管 SPA 首页 200；`npm run build` 通过，产物 36 个文件 / 约 1.7MB |
+
+---
+
+## 九、已知取舍
+
+- **下单没有收货人 / 电话 / 地址**，`POST /api/order/submit` 仍不带请求体（延续 v1.0 的最小化处理）。
+- **支付是模拟的**：没有接支付渠道，`PUT /api/order/{id}/pay` 直接把状态从 0 改成 1，
+  只是为了让「已支付 → 发货 → 确认收货」这条链能走通。
+- **过滤器每个请求多查一次数据库**（拿最新角色和状态）。换来的是禁用 / 改角色立即生效；
+  要省这一次查询，可以把 role/status 缓存进 Redis，或直接信任 Token 里的角色快照，
+  代价是「改完要等 Token 过期才生效」。
+- **Redis 全量降级**：Redis 挂了黑名单失效（已登出的 Token 又能用）、商品缓存失效。
+  演示项目里选择「可用性优先」；生产环境应该把 Redis 当必需依赖，黑名单查询失败时直接拒绝请求。
+- **商品删除是物理删除**：历史订单明细存的是快照，不受影响；
+  但购物车里引用到已删商品的行会被静默过滤掉（不是报错）。
+- **分页仍是 PageHelper**（`pageNum`/`pageSize`），没有引入 Spring Data 的 `Pageable`。
+- 前端 `index-*.js` 单包 1.27MB（gzip 410KB），Element Plus 是全量引入；
+  要减体积可以改按需引入或 `manualChunks` 拆包。
+- 前端只做了构建验证，**没有跑真实浏览器端到端**：
+  「登录 → 加购 → 下单 → 后台发货」这条链是在后端接口层验证的，没经过浏览器点击。
+1.Jwt退出时 Token 写入 Redis 黑名单，过滤器校验;Refresh Token 机制（短 Token 2h + 长 Token 7d）;拦截器统一解析，userId 放进 ThreadLocal
+2.商品模块 + Redis 缓存
+商品详情缓存 Redis GET product:{id}，miss 则查 DB 再 SET（TTL 30min）,空值缓存防穿透;查不到的商品也缓存 NULL，TTL 5min;随机 TTL 防雪崩,基础 30min + 随机 0~10min;商品列表加分页（Pageable）
+3.前后台分离
+前台商品搜索（按名称模糊查）、分类筛选、订单状态流转（取消/确认收货）;后台（Admin）商品 CRUD、订单管理（发货/关闭）、用户管理,接口鉴权;@PreAuthorize("hasRole('ADMIN')") 区分前后台分页所有列表接口加 Pageable
+4.购物车/订单优化
+购物车合并（登录后把 localStorage 里的临时购物车合并到 DB）
+订单创建纳入事务（@Transactional，创建订单 + 扣库存原子操作）
+库存扣减用数据库行锁（SELECT ... FOR UPDATE）
+5.加入Vue3 + Element Plus 构建响应式页面

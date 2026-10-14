@@ -7,6 +7,7 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -16,13 +17,17 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
  * 全局异常处理器。
  *
  * <p>有了它，Controller 和 Service 里一行 try-catch 都不用写，
- * 抛什么异常就返回什么格式的 JSON。分四层兜：
+ * 抛什么异常就返回什么格式的 JSON。分五层兜：
  * <ol>
  *   <li>业务异常：HTTP 状态码取 ErrorCode 里配的，业务码原样返回</li>
+ *   <li>权限不足（{@code @PreAuthorize} 校验失败）→ 403</li>
  *   <li>参数类异常：@Valid 校验失败、JSON 解析不了、路径参数类型不对 → 400</li>
  *   <li>数据库唯一键冲突 → 409</li>
  *   <li>其它未预料的异常 → 500，只回通用文案，不把堆栈暴露给前端</li>
  * </ol>
+ *
+ * <p>注意第 2 条必须显式写：{@code AccessDeniedException} 是 RuntimeException，
+ * 不单独处理的话会被最后的 Exception 兜底吞成 500，前端就看不到 403 了。
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -35,6 +40,18 @@ public class GlobalExceptionHandler {
         ErrorCode errorCode = exception.getErrorCode();
         return ResponseEntity.status(errorCode.getHttpStatus())
                 .body(ApiResult.error(errorCode.getCode(), exception.getMessage()));
+    }
+
+    /**
+     * 权限不足。
+     *
+     * <p>「没登录」在过滤器层就被拦下（走 RestSecurityHandlers 返 401），
+     * 能走到这里的是「登录了但角色不够」——比如普通用户访问后台接口。
+     */
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ApiResult<Void>> handleAccessDenied(AccessDeniedException exception) {
+        return ResponseEntity.status(ErrorCode.FORBIDDEN.getHttpStatus())
+                .body(ApiResult.error(ErrorCode.FORBIDDEN.getCode(), ErrorCode.FORBIDDEN.getMessage()));
     }
 
     /** 参数问题统一返回 400，取第一条校验失败的提示给前端 */

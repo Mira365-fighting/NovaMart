@@ -6,13 +6,15 @@ import lombok.Data;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
-/** product 表：在售商品。 */
+/** product 表：商品。前台只展示在售的，后台可以改上下架。 */
 @Data
 @TableName("product")
 public class Product {
 
     /** status = 1 表示在售 */
     public static final int STATUS_ON_SALE = 1;
+    /** status = 0 表示下架 */
+    public static final int STATUS_OFF_SALE = 0;
 
     private Long id;
 
